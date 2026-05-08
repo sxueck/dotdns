@@ -1,4 +1,4 @@
-//! TTL-aware response cache.
+//! Simple TTL cache.
 
 use crate::config::CacheConfig;
 use crate::metrics::MetricsRecorder;
@@ -62,9 +62,7 @@ impl Cache {
         }
     }
 
-    /// Lookup a cached response for the given query.
-    ///
-    /// Returns a cloned message with adjusted TTLs if the entry is still valid.
+    // Returns None if expired or missing.
     pub fn get(&self, query: &Message) -> Option<Message> {
         let key = CacheKey::from_message(query)?;
         let mut inner = self.inner.lock().unwrap();
@@ -96,7 +94,6 @@ impl Cache {
         Some(response)
     }
 
-    /// Insert a response into the cache keyed by the query.
     pub fn insert(&self, query: &Message, response: &Message) {
         let key = match CacheKey::from_message(query) {
             Some(k) => k,
@@ -136,6 +133,7 @@ impl Cache {
             }
         }
 
+        // naive eviction — just drop the first key. not LRU.
         if inner.entries.len() >= inner.config.capacity {
             if let Some(k) = inner.entries.keys().next().cloned() {
                 inner.entries.remove(&k);
@@ -153,14 +151,12 @@ impl Cache {
         inner.update_metric();
     }
 
-    /// Remove all cached entries.
     pub fn flush(&self) {
         let mut inner = self.inner.lock().unwrap();
         inner.entries.clear();
         inner.update_metric();
     }
 
-    /// Current number of cached entries.
     pub fn len(&self) -> usize {
         let inner = self.inner.lock().unwrap();
         inner.entries.len()

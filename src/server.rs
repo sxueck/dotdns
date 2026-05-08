@@ -1,7 +1,4 @@
-//! DoT server and resolver pipeline.
-//!
-//! Handles TLS termination, DNS message framing (2-byte length prefix),
-//! and the full resolver flow: blocklist -> cache -> upstream -> cache.
+//! DoT server.
 
 use crate::blocklist::ReloadableBlocklist;
 use crate::cache::Cache;
@@ -38,7 +35,7 @@ impl From<UpstreamError> for ServerError {
     }
 }
 
-/// DoT server that handles DNS queries over TLS.
+
 #[derive(Debug, Clone)]
 pub struct Server {
     config: Arc<Config>,
@@ -219,13 +216,7 @@ async fn write_message<W: AsyncWriteExt + Unpin>(
     Ok(())
 }
 
-/// Resolver pipeline.
-///
-/// 1. Increment total query metric.
-/// 2. Check blocklist.
-/// 3. Check cache.
-/// 4. Forward to upstream on miss.
-/// 5. Cache upstream response.
+/// Main resolve path.
 pub async fn resolve(
     query: Message,
     metrics: &MetricsRecorder,

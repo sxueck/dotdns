@@ -58,10 +58,10 @@ Unsupported advanced features are skipped, including regex rules, cosmetic/CSS r
 
 Blocked `A` queries return `0.0.0.0`; blocked `AAAA` queries return `::`. Exception rules override block rules.
 
-## Known Limitations
+## Limitations / TODO
 
-- `serve_stale` is currently accepted in config but not implemented; it is a no-op.
-- Per-upstream `tls_cert_path` certificate pinning is currently unsupported.
-- Cache eviction is capacity-based but not LRU.
-- Unix socket cleanup is self-healing on restart: a stale socket file is removed before binding.
-- Full AdGuard rule parity, certificate automation, authoritative records, clustering, and a web UI are out of scope.
+- `serve_stale` config option is accepted but does nothing right now.
+- `tls_cert_path` pinning isn't implemented.
+- Cache eviction is naive (not LRU) — should fix eventually.
+- Unix socket cleanup on shutdown is missing; restart handles stale sockets.
+- No AdGuard regex/modifier support, no cert automation, no clustering.

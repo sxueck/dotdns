@@ -1,8 +1,4 @@
-//! Local management API and CLI client.
-//!
-//! Implements a simple newline-delimited JSON protocol over Unix domain socket
-//! (default) or TCP loopback.  Each request is one JSON line; each response is
-//! one JSON line.
+//! Management API over unix socket or TCP loopback.
 
 use crate::blocklist::ReloadableBlocklist;
 use crate::cache::Cache;
@@ -358,7 +354,8 @@ impl ManagementClient {
 
 #[derive(Debug, thiserror::Error)]
 pub enum ManagementError {
-    #[error("management operation not yet implemented")]
+    // TODO: remove this, nothing uses it
+    #[error("not implemented")]
     NotImplemented,
     #[error("connection failed: {0}")]
     Connection(String),

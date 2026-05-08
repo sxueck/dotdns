@@ -2,9 +2,7 @@ use serde::{Deserialize, Serialize};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
 
-/// A lightweight, lock-free metrics recorder.
-///
-/// Downstream workstreams (WS-003 cache, WS-005 management) depend on these counters.
+/// Simple atomic metrics.
 #[derive(Debug)]
 pub struct MetricsRecorder {
     start_time: Instant,
@@ -59,7 +57,6 @@ impl MetricsRecorder {
         self.cache_entries.store(n, Ordering::Relaxed);
     }
 
-    /// Produce a snapshot for management reporting.
     pub fn snapshot(&self) -> MetricsSnapshot {
         MetricsSnapshot {
             uptime_secs: self.start_time.elapsed().as_secs(),
@@ -73,7 +70,7 @@ impl MetricsRecorder {
     }
 }
 
-/// Serializable metrics snapshot returned by management queries.
+
 #[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize, Serialize)]
 pub struct MetricsSnapshot {
     pub uptime_secs: u64,
@@ -86,7 +83,6 @@ pub struct MetricsSnapshot {
 }
 
 impl MetricsSnapshot {
-    /// Human-readable summary for CLI output.
     pub fn to_human_string(&self) -> String {
         format!(
             "uptime: {}s\n\

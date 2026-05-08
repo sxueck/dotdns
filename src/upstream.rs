@@ -21,7 +21,7 @@ use rustls::pki_types::ServerName;
 use std::sync::Arc as RustlsArc;
 use tokio_rustls::TlsConnector;
 
-/// Errors that can occur during upstream queries.
+
 #[derive(Debug, thiserror::Error, Clone)]
 pub enum UpstreamError {
     #[error("network error: {0}")]
@@ -58,9 +58,7 @@ impl From<reqwest::Error> for UpstreamError {
     }
 }
 
-/// Extract the host portion from an address string that may include a port.
-/// Supports `host:port` and `[ipv6]:port` forms. If no port is present,
-/// the original string is returned.
+// strip port for SNI
 fn extract_host(address: &str) -> &str {
     if let Some(rest) = address.strip_prefix('[') {
         if let Some((host, _)) = rest.split_once(']') {
@@ -74,10 +72,7 @@ fn extract_host(address: &str) -> &str {
 
 // --- Upstream Enum ---
 
-/// Shared upstream interface consumed by the resolver pipeline.
-///
-/// Uses an enum rather than a trait so we avoid an `async-trait`
-/// dependency while still providing a uniform query surface.
+/// Upstream wrapper enum.
 #[derive(Debug, Clone)]
 pub enum Upstream {
     Plain(PlainUpstream),
@@ -86,7 +81,6 @@ pub enum Upstream {
 }
 
 impl Upstream {
-    /// Create an upstream from a config entry.
     pub fn from_entry(entry: &UpstreamEntry) -> Result<Self, UpstreamError> {
         if entry.tls_cert_path.is_some() {
             return Err(UpstreamError::UnsupportedFeature(
@@ -100,7 +94,6 @@ impl Upstream {
         }
     }
 
-    /// Send a DNS message and return the response.
     pub async fn query(&self, message: &Message) -> Result<Message, UpstreamError> {
         match self {
             Upstream::Plain(u) => u.query(message).await,
@@ -109,7 +102,6 @@ impl Upstream {
         }
     }
 
-    /// Return a human-readable identifier for this upstream.
     pub fn name(&self) -> &str {
         match self {
             Upstream::Plain(u) => &u.address,
@@ -187,8 +179,7 @@ impl PlainUpstream {
     }
 }
 
-/// Check whether a raw DNS message has the TC (truncated) bit set.
-/// TC is bit 1 of byte 2 in the DNS header (0-indexed from LSB).
+// check TC bit in DNS header
 fn is_truncated(msg: &Message) -> bool {
     // Hickory Message doesn't expose raw header bytes directly in a stable way.
     // Serialize and inspect the wire-format header directly.
@@ -299,7 +290,7 @@ impl DohUpstream {
 
 // --- Upstream Pool (fallback) ---
 
-/// A pool of upstreams that are tried in order until one succeeds.
+
 #[derive(Debug, Clone)]
 pub struct UpstreamPool {
     upstreams: Vec<(Upstream, String)>,
@@ -311,8 +302,6 @@ impl UpstreamPool {
         Self { upstreams, metrics }
     }
 
-    /// Send a DNS message to each upstream in order until one returns
-    /// a successful response.
     pub async fn query(&self, message: &Message) -> Result<Message, UpstreamError> {
         let mut last_err = None;
 
@@ -341,7 +330,7 @@ impl UpstreamPool {
     }
 }
 
-/// Build an upstream pool from config entries.
+
 pub fn pool_from_config(
     entries: &[UpstreamEntry],
     metrics: Option<Arc<MetricsRecorder>>,
@@ -378,7 +367,6 @@ mod tests {
         });
     }
 
-    /// Build a simple DNS query message for testing.
     fn test_query() -> Message {
         let mut msg = Message::new();
         msg.set_message_type(MessageType::Query);
@@ -391,8 +379,6 @@ mod tests {
         msg
     }
 
-    /// Spin up a fake UDP DNS server that echoes the query id and returns
-    /// a minimal response with the QR bit set.
     async fn start_mock_udp_server(bind: &str) -> tokio::task::JoinHandle<()> {
         let socket = UdpSocket::bind(bind).await.unwrap();
         tokio::spawn(async move {

@@ -22,7 +22,7 @@ use tracing::info;
 
 #[tokio::main]
 async fn main() {
-    // Ensure the rustls ring crypto provider is installed before any TLS usage.
+    // rustls needs this explicitly in recent versions
     rustls::crypto::ring::default_provider()
         .install_default()
         .expect("ring crypto provider install");
@@ -136,6 +136,7 @@ fn load_mgmt_transport(config: Option<PathBuf>) -> ManagementTransport {
 }
 
 async fn run_serve(cfg: Config) {
+    // TODO: graceful shutdown could be cleaner
     let cfg = Arc::new(cfg);
     let metrics = Arc::new(MetricsRecorder::new());
     let cache = Arc::new(Cache::new(cfg.cache.clone(), metrics.clone()));

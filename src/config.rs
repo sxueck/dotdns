@@ -15,13 +15,13 @@ pub enum ConfigError {
     NoUpstreams,
     #[error("blocklist path does not exist: {0}")]
     BlocklistPathNotFound(PathBuf),
-    #[error("TLS certificate and private key are both required when TLS is enabled")]
+    #[error("tls cert and key required")]
     TlsIncomplete,
-    #[error("management bind must be loopback when using TCP (found {0})")]
+    #[error("management must bind to loopback, got {0}")]
     ManagementNotLoopback(String),
 }
 
-/// Top-level configuration for dotdns.
+
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct Config {
     pub server: ServerConfig,
@@ -40,7 +40,6 @@ pub struct Config {
 }
 
 impl Config {
-    /// Parse config from a TOML string.
     pub fn from_toml(source: &str) -> Result<Self, ConfigError> {
         let cfg: Config = toml::from_str(source).map_err(|e| ConfigError::InvalidValue {
             field: "config".into(),
@@ -50,7 +49,7 @@ impl Config {
         Ok(cfg)
     }
 
-    /// Validate business rules beyond deserialization.
+    // TODO: this got a bit long, maybe split up later
     pub fn validate(&self) -> Result<(), ConfigError> {
         if self.upstreams.is_empty() {
             return Err(ConfigError::NoUpstreams);
@@ -67,7 +66,7 @@ impl Config {
                 if host.parse::<IpAddr>().is_ok() {
                     return Err(ConfigError::InvalidValue {
                         field: format!("upstreams[{}].address", i),
-                        message: "DoT upstream address must use a hostname, not an IP address, for TLS certificate validation".into(),
+                        message: "DoT upstream needs a hostname, not an IP".into(),
                     });
                 }
             }
@@ -95,7 +94,7 @@ fn is_loopback(addr: &SocketAddr) -> bool {
     addr.ip().is_loopback()
 }
 
-/// Extract the host portion from an address string that may include a port.
+// strip port from address
 fn host_from_address(address: &str) -> &str {
     if let Some(rest) = address.strip_prefix('[') {
         if let Some((host, _)) = rest.split_once(']') {
@@ -109,9 +108,8 @@ fn host_from_address(address: &str) -> &str {
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct ServerConfig {
-    /// Address to bind the DoT server.
     pub bind: SocketAddr,
-    /// Connection idle timeout.
+    /// idle timeout
     #[serde(default = "default_idle_timeout", with = "humantime_serde")]
     pub idle_timeout: Duration,
 }
@@ -138,7 +136,7 @@ impl Default for TlsConfig {
     }
 }
 
-/// Supported upstream protocols.
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum UpstreamProtocol {
@@ -167,35 +165,24 @@ impl fmt::Display for UpstreamProtocol {
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct UpstreamEntry {
-    /// Human-readable name.
     pub name: String,
-    /// Endpoint address (e.g., `1.1.1.1:53`, `cloudflare-dns.com:853`).
-    /// For DoT, use a hostname rather than an IP address so TLS SNI and
-    /// certificate validation work correctly. IPv6 addresses must be wrapped
-    /// in brackets (e.g., `[2001:db8::1]:853`).
     pub address: String,
-    /// Protocol to use.
     #[serde(default)]
     pub protocol: UpstreamProtocol,
-    /// Optional TLS certificate path for DoT/DoH when pinning is desired.
     pub tls_cert_path: Option<PathBuf>,
-    /// Optional HTTP/2 settings for DoH (e.g., `h2_only`).
     #[serde(default)]
     pub extra: HashMap<String, toml::Value>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct CacheConfig {
-    /// Maximum number of cached entries.
     #[serde(default = "default_cache_capacity")]
     pub capacity: usize,
-    /// Minimum TTL to enforce (clamps response TTL).
     #[serde(default, with = "humantime_serde")]
     pub min_ttl: Option<Duration>,
-    /// Maximum TTL to enforce (clamps response TTL).
     #[serde(default, with = "humantime_serde")]
     pub max_ttl: Option<Duration>,
-    /// Whether to serve stale entries while refreshing in background.
+    // TODO: actually implement stale serving
     #[serde(default)]
     pub serve_stale: bool,
 }
@@ -217,10 +204,8 @@ impl Default for CacheConfig {
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct BlocklistConfig {
-    /// Paths to AdGuard-compatible blocklist files.
     #[serde(default)]
     pub paths: Vec<PathBuf>,
-    /// Enable blocklist matching.
     #[serde(default = "default_true")]
     pub enabled: bool,
 }

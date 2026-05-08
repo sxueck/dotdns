@@ -17,14 +17,11 @@ use std::io::{self, BufRead};
 use std::path::PathBuf;
 use std::sync::RwLock;
 
-/// Result of a blocklist lookup.
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BlockDecision {
-    /// Domain is not blocked.
     Allow,
-    /// Domain is blocked (no matching exception).
     Block,
-    /// Domain matches an exception rule, overriding any block.
     Exception,
 }
 
@@ -34,14 +31,13 @@ impl BlockDecision {
     }
 }
 
-/// Normalized rule used internally for matching.
+
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 enum NormalizedRule {
-    /// Matches the exact domain and all its subdomains.
     Domain(String),
 }
 
-/// Immutable blocklist engine holding parsed rules.
+
 #[derive(Debug, Clone, Default)]
 pub struct BlocklistEngine {
     blocks: HashSet<NormalizedRule>,
@@ -49,7 +45,6 @@ pub struct BlocklistEngine {
 }
 
 impl BlocklistEngine {
-    /// Create an empty engine.
     pub fn empty() -> Self {
         Self {
             blocks: HashSet::new(),
@@ -57,9 +52,7 @@ impl BlocklistEngine {
         }
     }
 
-    /// Load and parse rules from the given file paths.
-    ///
-    /// Returns the engine and a [`ParseReport`] describing what was skipped.
+    // Returns (engine, report). report tells you how many lines were skipped.
     pub fn from_paths(paths: &[PathBuf]) -> Result<(Self, ParseReport), BlocklistError> {
         let mut engine = Self::empty();
         let mut report = ParseReport::default();
@@ -92,9 +85,7 @@ impl BlocklistEngine {
         Ok((engine, report))
     }
 
-    /// Decide whether a domain is blocked.
-    ///
-    /// Exception rules take precedence over block rules.
+    // Exception rules win over block rules.
     pub fn decide(&self, domain: &str) -> BlockDecision {
         let normalized = normalize_domain(domain);
         if self.matches_exception(&normalized) {
@@ -131,23 +122,18 @@ impl BlocklistEngine {
         self.exceptions.len()
     }
 
-    /// Add a block rule for testing.
     pub fn add_block(&mut self, domain: &str) {
         self.blocks
             .insert(NormalizedRule::Domain(normalize_domain(domain)));
     }
 
-    /// Add an exception rule for testing.
     pub fn add_exception(&mut self, domain: &str) {
         self.exceptions
             .insert(NormalizedRule::Domain(normalize_domain(domain)));
     }
 }
 
-/// Thread-safe, reloadable blocklist wrapper.
-///
-/// On [`reload`](Self::reload), if parsing fails the previously active
-/// rules remain in place.
+/// Thread-safe reloadable wrapper.
 #[derive(Debug)]
 pub struct ReloadableBlocklist {
     engine: RwLock<BlocklistEngine>,
@@ -169,9 +155,7 @@ impl ReloadableBlocklist {
         }
     }
 
-    /// Load rules from configured paths.
-    ///
-    /// If loading fails, the old rules are preserved.
+    // If reload fails, old rules stick around.
     pub fn reload(&self) -> Result<ParseReport, BlocklistError> {
         let (new_engine, report) = BlocklistEngine::from_paths(&self.paths)?;
         let mut guard = self.engine.write().expect("blocklist write lock poisoned");
@@ -179,7 +163,6 @@ impl ReloadableBlocklist {
         Ok(report)
     }
 
-    /// Current block decision for a domain.
     pub fn decide(&self, domain: &str) -> BlockDecision {
         let guard = self.engine.read().expect("blocklist read lock poisoned");
         guard.decide(domain)
@@ -200,19 +183,17 @@ impl ReloadableBlocklist {
     }
 }
 
-/// Errors that can occur when loading blocklists.
+
 #[derive(Debug, thiserror::Error)]
 pub enum BlocklistError {
     #[error("failed to read blocklist {path}: {source}")]
     Io { path: PathBuf, source: io::Error },
 }
 
-/// Summary of parsing outcomes.
+
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ParseReport {
-    /// Total lines inspected (including blank lines and comments).
     pub total: u64,
-    /// Lines skipped because they contain unsupported features.
     pub unsupported: u64,
 }
 
@@ -226,9 +207,7 @@ impl fmt::Display for ParseReport {
     }
 }
 
-/// Helpers for constructing blocked DNS responses.
-///
-/// WS-003 will wire these values into the resolver pipeline.
+/// Blocked response IPs.
 pub struct BlockedResponse;
 
 impl BlockedResponse {
@@ -247,8 +226,7 @@ impl BlockedResponse {
         Self::IPV6
     }
 
-    /// Returns true to indicate that other query types should receive an
-    /// empty success response. WS-003 constructs the actual DNS message.
+    /// Other query types get an empty NOERROR response.
     pub fn empty_for_other_types() -> bool {
         true
     }

@@ -64,12 +64,11 @@ mod tests {
 
     #[test]
     fn verify_cli() {
-        // Ensures clap derive setup is valid and doesn't panic.
         Cli::command().debug_assert();
     }
 
     #[test]
-    fn parses_documented_command_shapes() {
+    fn cli_parsing() {
         let cases = [
             vec!["dotdns", "serve", "--config", "dotdns.toml"],
             vec!["dotdns", "status"],
