@@ -1,0 +1,57 @@
+# Example dotdns configuration.
+# Copy to /etc/dotdns/dotdns.toml or pass via `dotdns serve --config <path>`.
+
+[server]
+# Address to bind the DoT listener.
+bind = "0.0.0.0:853"
+# Idle timeout for TLS connections.
+idle_timeout = "60s"
+
+[tls]
+# TLS is required for DoT. Set enabled = false only for local testing without TLS.
+enabled = true
+cert_path = "/etc/dotdns/cert.pem"
+key_path = "/etc/dotdns/key.pem"
+
+# Upstream resolvers are tried in order until one succeeds.
+[[upstreams]]
+name = "cloudflare-dot"
+address = "cloudflare-dns.com:853"
+protocol = "dot"
+
+[[upstreams]]
+name = "cloudflare-doh"
+address = "https://cloudflare-dns.com/dns-query"
+protocol = "doh"
+
+[[upstreams]]
+name = "google-plain"
+address = "8.8.8.8:53"
+protocol = "plain"
+
+[cache]
+capacity = 10000
+# Clamp response TTLs between min and max.
+min_ttl = "5s"
+max_ttl = "1h"
+# Currently accepted but not implemented; leave false unless future releases add it.
+serve_stale = false
+
+[blocklist]
+enabled = true
+paths = [
+    # "/etc/dotdns/blocklists/adguard-dns.txt",
+]
+
+[management]
+# Local-only management. Use Unix socket by default.
+type = "unix"
+path = "/tmp/dotdns.sock"
+
+# TCP loopback fallback (commented out to show syntax).
+# type = "tcp"
+# bind = "127.0.0.1:9953"
+
+[logging]
+level = "info"
+format = "pretty"

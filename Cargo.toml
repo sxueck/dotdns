@@ -1,0 +1,27 @@
+[package]
+name = "dotdns"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+tokio = { version = "1", features = ["full"] }
+clap = { version = "4", features = ["derive"] }
+serde = { version = "1", features = ["derive"] }
+toml = "0.8"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+thiserror = "2"
+humantime-serde = "1"
+serde_json = "1"
+# DNS protocol primitives for raw message encode/decode; avoids re-implementing wire format.
+hickory-proto = { version = "0.24", default-features = false }
+# HTTP client for DoH transport.
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "http2"] }
+# TLS stack for DoT transport.
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+tokio-rustls = "0.26"
+webpki-roots = "0.26"
+rustls-pemfile = "2"
+
+[dev-dependencies]
+tempfile = "3"
