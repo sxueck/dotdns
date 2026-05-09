@@ -16,7 +16,10 @@ use std::fs;
 use std::io::{self, BufRead};
 use std::path::PathBuf;
 use std::sync::RwLock;
+use std::time::Duration;
 
+use crate::config::BlocklistConfig;
+use tokio::sync::Mutex;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BlockDecision {
@@ -31,12 +34,16 @@ impl BlockDecision {
     }
 }
 
-
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 enum NormalizedRule {
     Domain(String),
 }
 
+#[derive(Debug, Clone, Copy)]
+enum RuleTarget {
+    Block,
+    Allow,
+}
 
 #[derive(Debug, Clone, Default)]
 pub struct BlocklistEngine {
@@ -54,8 +61,26 @@ impl BlocklistEngine {
 
     // Returns (engine, report). report tells you how many lines were skipped.
     pub fn from_paths(paths: &[PathBuf]) -> Result<(Self, ParseReport), BlocklistError> {
+        Self::from_sources(paths, &[])
+    }
+
+    pub fn from_sources(
+        block_paths: &[PathBuf],
+        allow_paths: &[PathBuf],
+    ) -> Result<(Self, ParseReport), BlocklistError> {
         let mut engine = Self::empty();
         let mut report = ParseReport::default();
+        engine.load_paths(block_paths, RuleTarget::Block, &mut report)?;
+        engine.load_paths(allow_paths, RuleTarget::Allow, &mut report)?;
+        Ok((engine, report))
+    }
+
+    fn load_paths(
+        &mut self,
+        paths: &[PathBuf],
+        target: RuleTarget,
+        report: &mut ParseReport,
+    ) -> Result<(), BlocklistError> {
         for path in paths {
             let file = fs::File::open(path).map_err(|e| BlocklistError::Io {
                 path: path.clone(),
@@ -70,10 +95,10 @@ impl BlocklistEngine {
                 match parse_line(&line) {
                     ParsedLine::Skip => {}
                     ParsedLine::Block(rule) => {
-                        engine.blocks.insert(rule);
+                        self.insert_rule(rule, target);
                     }
                     ParsedLine::Exception(rule) => {
-                        engine.exceptions.insert(rule);
+                        self.exceptions.insert(rule);
                     }
                     ParsedLine::Unsupported => {
                         report.unsupported += 1;
@@ -82,7 +107,18 @@ impl BlocklistEngine {
                 report.total += 1;
             }
         }
-        Ok((engine, report))
+        Ok(())
+    }
+
+    fn insert_rule(&mut self, rule: NormalizedRule, target: RuleTarget) {
+        match target {
+            RuleTarget::Block => {
+                self.blocks.insert(rule);
+            }
+            RuleTarget::Allow => {
+                self.exceptions.insert(rule);
+            }
+        }
     }
 
     // Exception rules win over block rules.
@@ -138,6 +174,10 @@ impl BlocklistEngine {
 pub struct ReloadableBlocklist {
     engine: RwLock<BlocklistEngine>,
     paths: Vec<PathBuf>,
+    allowlist_paths: Vec<PathBuf>,
+    remote: RemoteBlocklists,
+    allowlist_remote: RemoteBlocklists,
+    refresh_lock: Mutex<()>,
 }
 
 impl ReloadableBlocklist {
@@ -145,6 +185,31 @@ impl ReloadableBlocklist {
         Self {
             engine: RwLock::new(BlocklistEngine::empty()),
             paths,
+            allowlist_paths: Vec::new(),
+            remote: RemoteBlocklists::default(),
+            allowlist_remote: RemoteBlocklists::default(),
+            refresh_lock: Mutex::new(()),
+        }
+    }
+
+    pub fn from_config(config: &BlocklistConfig) -> Self {
+        Self {
+            engine: RwLock::new(BlocklistEngine::empty()),
+            paths: config.paths.clone(),
+            allowlist_paths: config.allowlist_paths.clone(),
+            remote: RemoteBlocklists {
+                urls: config.urls.clone(),
+                download_dir: config.download_dir.clone(),
+                timeout: config.download_timeout,
+                file_prefix: "subscription".into(),
+            },
+            allowlist_remote: RemoteBlocklists {
+                urls: config.allowlist_urls.clone(),
+                download_dir: config.download_dir.clone(),
+                timeout: config.download_timeout,
+                file_prefix: "allowlist".into(),
+            },
+            refresh_lock: Mutex::new(()),
         }
     }
 
@@ -152,15 +217,28 @@ impl ReloadableBlocklist {
         Self {
             engine: RwLock::new(engine),
             paths,
+            allowlist_paths: Vec::new(),
+            remote: RemoteBlocklists::default(),
+            allowlist_remote: RemoteBlocklists::default(),
+            refresh_lock: Mutex::new(()),
         }
     }
 
     // If reload fails, old rules stick around.
     pub fn reload(&self) -> Result<ParseReport, BlocklistError> {
-        let (new_engine, report) = BlocklistEngine::from_paths(&self.paths)?;
+        let block_paths = self.all_block_paths();
+        let allow_paths = self.all_allow_paths();
+        let (new_engine, report) = BlocklistEngine::from_sources(&block_paths, &allow_paths)?;
         let mut guard = self.engine.write().expect("blocklist write lock poisoned");
         *guard = new_engine;
         Ok(report)
+    }
+
+    pub async fn refresh_and_reload(&self) -> Result<ParseReport, BlocklistError> {
+        let _guard = self.refresh_lock.lock().await;
+        self.remote.refresh().await?;
+        self.allowlist_remote.refresh().await?;
+        self.reload()
     }
 
     pub fn decide(&self, domain: &str) -> BlockDecision {
@@ -170,6 +248,18 @@ impl ReloadableBlocklist {
 
     pub fn paths(&self) -> &[PathBuf] {
         &self.paths
+    }
+
+    fn all_block_paths(&self) -> Vec<PathBuf> {
+        let mut paths = self.paths.clone();
+        paths.extend(self.remote.paths());
+        paths
+    }
+
+    fn all_allow_paths(&self) -> Vec<PathBuf> {
+        let mut paths = self.allowlist_paths.clone();
+        paths.extend(self.allowlist_remote.paths());
+        paths
     }
 
     pub fn block_count(&self) -> usize {
@@ -183,13 +273,90 @@ impl ReloadableBlocklist {
     }
 }
 
+#[derive(Debug, Clone, Default)]
+struct RemoteBlocklists {
+    urls: Vec<String>,
+    download_dir: PathBuf,
+    timeout: Duration,
+    file_prefix: String,
+}
+
+impl RemoteBlocklists {
+    async fn refresh(&self) -> Result<(), BlocklistError> {
+        if self.urls.is_empty() {
+            return Ok(());
+        }
+
+        fs::create_dir_all(&self.download_dir).map_err(|e| BlocklistError::Io {
+            path: self.download_dir.clone(),
+            source: e,
+        })?;
+
+        let client = reqwest::Client::builder()
+            .timeout(self.timeout)
+            .build()
+            .map_err(BlocklistError::HttpClient)?;
+
+        let mut staged = Vec::with_capacity(self.urls.len());
+        for (idx, url) in self.urls.iter().enumerate() {
+            let body = client
+                .get(url)
+                .send()
+                .await
+                .map_err(|source| BlocklistError::Download {
+                    url: url.clone(),
+                    source,
+                })?
+                .error_for_status()
+                .map_err(|source| BlocklistError::Download {
+                    url: url.clone(),
+                    source,
+                })?
+                .bytes()
+                .await
+                .map_err(|source| BlocklistError::Download {
+                    url: url.clone(),
+                    source,
+                })?;
+            let body = String::from_utf8_lossy(&body);
+
+            let final_path = self.path_for(idx);
+            let tmp_path = final_path.with_extension("tmp");
+            fs::write(&tmp_path, body.as_bytes()).map_err(|e| BlocklistError::Io {
+                path: tmp_path.clone(),
+                source: e,
+            })?;
+            staged.push((tmp_path, final_path));
+        }
+
+        for (tmp_path, final_path) in staged {
+            fs::rename(&tmp_path, &final_path).map_err(|e| BlocklistError::Io {
+                path: final_path,
+                source: e,
+            })?;
+        }
+        Ok(())
+    }
+
+    fn paths(&self) -> Vec<PathBuf> {
+        (0..self.urls.len()).map(|idx| self.path_for(idx)).collect()
+    }
+
+    fn path_for(&self, idx: usize) -> PathBuf {
+        self.download_dir
+            .join(format!("{}-{idx:04}.txt", self.file_prefix))
+    }
+}
 
 #[derive(Debug, thiserror::Error)]
 pub enum BlocklistError {
     #[error("failed to read blocklist {path}: {source}")]
     Io { path: PathBuf, source: io::Error },
+    #[error("failed to create HTTP client for blocklist downloads: {0}")]
+    HttpClient(reqwest::Error),
+    #[error("failed to download blocklist {url}: {source}")]
+    Download { url: String, source: reqwest::Error },
 }
-
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ParseReport {
@@ -379,7 +546,10 @@ fn domain_suffixes(domain: &str) -> impl Iterator<Item = &str> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::BlocklistConfig;
     use std::io::Write;
+    use std::time::Duration;
+    use tokio::io::AsyncWriteExt as _;
 
     fn make_temp_file(content: &str) -> tempfile::NamedTempFile {
         let mut file = tempfile::NamedTempFile::new().unwrap();
@@ -421,6 +591,20 @@ mod tests {
 
         assert_eq!(engine.decide("example.com"), BlockDecision::Exception);
         assert_eq!(engine.decide("www.example.com"), BlockDecision::Exception);
+    }
+
+    #[test]
+    fn allowlist_paths_override_blocklist_paths() {
+        let block_file = make_temp_file("ads.example.com\n");
+        let allow_file = make_temp_file("ads.example.com\n");
+
+        let (engine, _) = BlocklistEngine::from_sources(
+            &[block_file.path().to_path_buf()],
+            &[allow_file.path().to_path_buf()],
+        )
+        .unwrap();
+
+        assert_eq!(engine.decide("ads.example.com"), BlockDecision::Exception);
     }
 
     #[test]
@@ -650,5 +834,39 @@ supported.example
         let (engine, _) = BlocklistEngine::from_paths(&paths).unwrap();
         assert_eq!(engine.decide("a.com"), BlockDecision::Block);
         assert_eq!(engine.decide("b.com"), BlockDecision::Block);
+    }
+
+    #[tokio::test]
+    async fn refresh_and_reload_downloads_remote_subscription() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let _server = tokio::spawn(async move {
+            for body in ["remote.test", "remote.test"] {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                stream.write_all(response.as_bytes()).await.unwrap();
+            }
+        });
+
+        let dir = tempfile::tempdir().unwrap();
+        let config = BlocklistConfig {
+            urls: vec![format!("http://{addr}/list.txt")],
+            allowlist_urls: vec![format!("http://{addr}/allow.txt")],
+            download_dir: dir.path().to_path_buf(),
+            download_timeout: Duration::from_secs(5),
+            ..BlocklistConfig::default()
+        };
+        let reloadable = ReloadableBlocklist::from_config(&config);
+
+        let report = reloadable.refresh_and_reload().await.unwrap();
+
+        assert_eq!(report.total, 2);
+        assert_eq!(reloadable.decide("remote.test"), BlockDecision::Exception);
+        assert!(dir.path().join("subscription-0000.txt").exists());
+        assert!(dir.path().join("allowlist-0000.txt").exists());
     }
 }

@@ -7,7 +7,7 @@
 - Public client-facing service: DoT on port `853`.
 - TLS certificate and private key are provided by the operator via `tls.cert_path` and `tls.key_path`.
 - Binding port `853` as a non-root user may require elevated permissions or a platform-specific capability such as `CAP_NET_BIND_SERVICE` on Linux.
-- The management interface is local-only by default, using Unix socket `/tmp/dotdns.sock`.
+- The management interface is local-only by default. The example systemd deployment uses Unix socket `/run/dotdns/dotdns.sock`.
 
 Start the service with:
 
@@ -25,7 +25,9 @@ Upstreams are tried in order until one succeeds, so later entries act as fallbac
 - DNS-over-TLS: `protocol = "dot"`
 - DNS-over-HTTPS: `protocol = "doh"`
 
-Cache settings include `capacity`, `min_ttl`, and `max_ttl`. Blocklists are configured under `[blocklist]` with `enabled` and `paths`.
+Cache settings include `capacity`, `min_ttl`, and `max_ttl`. EDNS settings live under `[edns]`; enabling `[edns.client_subnet]` sends an ECS option derived from the client IP to upstream resolvers, using `/24` for IPv4 and `/56` for IPv6 by default while excluding private/local addresses. Client-provided ECS is preserved when `preserve_client = true`.
+
+Blocklists are configured under `[blocklist]` with `enabled`, local `paths`, and optional remote subscription `urls`. Allowlist sources use `allowlist_paths` and `allowlist_urls`; they support the same local and remote loading flow and take precedence over block rules. Remote subscriptions are downloaded to `download_dir` on startup, on `dotdns blocklist reload`, and periodically when `refresh_interval` is set.
 
 DoT upstreams must use a hostname, not a raw IP address, so TLS SNI and certificate validation can work. Per-upstream `tls_cert_path` pinning is not implemented and is rejected during upstream setup.
 
@@ -57,6 +59,22 @@ The parser supports this AdGuard Home-compatible subset:
 Unsupported advanced features are skipped, including regex rules, cosmetic/CSS rules, scriptlet rules, and rules with modifiers such as `$third-party` or `$important`.
 
 Blocked `A` queries return `0.0.0.0`; blocked `AAAA` queries return `::`. Exception rules override block rules.
+
+## systemd
+
+Example units live under `packaging/systemd`. They assume the binary is installed in `/usr/local/bin`, configuration is copied to `/etc/dotdns/dotdns.toml`, runtime sockets stay under `/run/dotdns`, and downloaded blocklists stay under `/var/lib/dotdns/blocklists` so they survive restarts.
+
+```sh
+install -Dm755 target/release/dotdns /usr/local/bin/dotdns
+install -Dm644 examples/dotdns.toml /etc/dotdns/dotdns.toml
+install -Dm644 packaging/systemd/dotdns.service /etc/systemd/system/dotdns.service
+install -Dm644 packaging/systemd/dotdns.tmpfiles /etc/tmpfiles.d/dotdns.conf
+systemd-tmpfiles --create /etc/tmpfiles.d/dotdns.conf
+systemctl daemon-reload
+systemctl enable --now dotdns.service
+```
+
+Create the `dotdns` system user before enabling the service, and ensure `/etc/dotdns/dotdns.toml` points at valid TLS certificate and key files. `systemctl reload dotdns.service` maps to `dotdns blocklist reload`, which fetches remote subscriptions and swaps in the parsed rules without restarting the resolver.
 
 ## Limitations / TODO
 

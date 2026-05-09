@@ -37,16 +37,39 @@ max_ttl = "1h"
 # Currently accepted but not implemented; leave false unless future releases add it.
 serve_stale = false
 
+[edns]
+enabled = true
+preserve_client = true
+
+[edns.client_subnet]
+# Disabled by default for privacy. Enable to send client-derived ECS upstream.
+enabled = false
+ipv4_prefix = 24
+ipv6_prefix = 56
+exclude_private = true
+
 [blocklist]
 enabled = true
 paths = [
     # "/etc/dotdns/blocklists/adguard-dns.txt",
 ]
+urls = [
+    # "https://adguardteam.github.io/HostlistsRegistry/assets/filter_1.txt",
+]
+allowlist_paths = [
+    # "/etc/dotdns/blocklists/allowlist.txt",
+]
+allowlist_urls = [
+    # "https://example.com/dotdns-allowlist.txt",
+]
+download_dir = "/var/lib/dotdns/blocklists"
+refresh_interval = "6h"
+download_timeout = "30s"
 
 [management]
 # Local-only management. Use Unix socket by default.
 type = "unix"
-path = "/tmp/dotdns.sock"
+path = "/run/dotdns/dotdns.sock"
 
 # TCP loopback fallback (commented out to show syntax).
 # type = "tcp"

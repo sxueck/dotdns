@@ -140,9 +140,9 @@ async fn run_serve(cfg: Config) {
     let cfg = Arc::new(cfg);
     let metrics = Arc::new(MetricsRecorder::new());
     let cache = Arc::new(Cache::new(cfg.cache.clone(), metrics.clone()));
-    let blocklist = Arc::new(ReloadableBlocklist::new(cfg.blocklist.paths.clone()));
+    let blocklist = Arc::new(ReloadableBlocklist::from_config(&cfg.blocklist));
     if cfg.blocklist.enabled {
-        match blocklist.reload() {
+        match blocklist.refresh_and_reload().await {
             Ok(report) => {
                 tracing::info!("blocklist loaded: {}", report);
             }
@@ -150,6 +150,20 @@ async fn run_serve(cfg: Config) {
                 tracing::warn!(error = %e, "initial blocklist load failed");
             }
         }
+    }
+    if let (true, Some(interval)) = (cfg.blocklist.enabled, cfg.blocklist.refresh_interval) {
+        let blocklist = blocklist.clone();
+        tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(interval);
+            ticker.tick().await;
+            loop {
+                ticker.tick().await;
+                match blocklist.refresh_and_reload().await {
+                    Ok(report) => tracing::info!("blocklist refreshed: {}", report),
+                    Err(e) => tracing::warn!(error = %e, "blocklist refresh failed"),
+                }
+            }
+        });
     }
     let pool = match upstream::pool_from_config(&cfg.upstreams, Some(metrics.clone())) {
         Ok(p) => p,

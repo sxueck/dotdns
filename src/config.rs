@@ -15,12 +15,17 @@ pub enum ConfigError {
     NoUpstreams,
     #[error("blocklist path does not exist: {0}")]
     BlocklistPathNotFound(PathBuf),
+    #[error("allowlist path does not exist: {0}")]
+    AllowlistPathNotFound(PathBuf),
+    #[error("invalid blocklist url: {0}")]
+    InvalidBlocklistUrl(String),
+    #[error("invalid allowlist url: {0}")]
+    InvalidAllowlistUrl(String),
     #[error("tls cert and key required")]
     TlsIncomplete,
     #[error("management must bind to loopback, got {0}")]
     ManagementNotLoopback(String),
 }
-
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct Config {
@@ -31,6 +36,8 @@ pub struct Config {
     pub upstreams: Vec<UpstreamEntry>,
     #[serde(default)]
     pub cache: CacheConfig,
+    #[serde(default)]
+    pub edns: EdnsConfig,
     #[serde(default)]
     pub blocklist: BlocklistConfig,
     #[serde(default)]
@@ -86,6 +93,47 @@ impl Config {
                 return Err(ConfigError::BlocklistPathNotFound(path.clone()));
             }
         }
+        for path in &self.blocklist.allowlist_paths {
+            if !path.exists() {
+                return Err(ConfigError::AllowlistPathNotFound(path.clone()));
+            }
+        }
+        for url in &self.blocklist.urls {
+            if !url.starts_with("http://") && !url.starts_with("https://") {
+                return Err(ConfigError::InvalidBlocklistUrl(url.clone()));
+            }
+        }
+        for url in &self.blocklist.allowlist_urls {
+            if !url.starts_with("http://") && !url.starts_with("https://") {
+                return Err(ConfigError::InvalidAllowlistUrl(url.clone()));
+            }
+        }
+        if let Some(interval) = self.blocklist.refresh_interval {
+            if interval.is_zero() {
+                return Err(ConfigError::InvalidValue {
+                    field: "blocklist.refresh_interval".into(),
+                    message: "refresh interval must be greater than zero".into(),
+                });
+            }
+        }
+        if self.blocklist.download_timeout.is_zero() {
+            return Err(ConfigError::InvalidValue {
+                field: "blocklist.download_timeout".into(),
+                message: "download timeout must be greater than zero".into(),
+            });
+        }
+        if self.edns.client_subnet.ipv4_prefix > 32 {
+            return Err(ConfigError::InvalidValue {
+                field: "edns.client_subnet.ipv4_prefix".into(),
+                message: "IPv4 ECS prefix must be between 0 and 32".into(),
+            });
+        }
+        if self.edns.client_subnet.ipv6_prefix > 128 {
+            return Err(ConfigError::InvalidValue {
+                field: "edns.client_subnet.ipv6_prefix".into(),
+                message: "IPv6 ECS prefix must be between 0 and 128".into(),
+            });
+        }
         Ok(())
     }
 }
@@ -135,7 +183,6 @@ impl Default for TlsConfig {
         }
     }
 }
-
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(rename_all = "lowercase")]
@@ -203,9 +250,75 @@ impl Default for CacheConfig {
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct EdnsConfig {
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    #[serde(default = "default_true")]
+    pub preserve_client: bool,
+    #[serde(default)]
+    pub client_subnet: ClientSubnetConfig,
+}
+
+impl Default for EdnsConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            preserve_client: true,
+            client_subnet: ClientSubnetConfig::default(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct ClientSubnetConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default = "default_ipv4_ecs_prefix")]
+    pub ipv4_prefix: u8,
+    #[serde(default = "default_ipv6_ecs_prefix")]
+    pub ipv6_prefix: u8,
+    #[serde(default = "default_true")]
+    pub exclude_private: bool,
+}
+
+impl Default for ClientSubnetConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            ipv4_prefix: default_ipv4_ecs_prefix(),
+            ipv6_prefix: default_ipv6_ecs_prefix(),
+            exclude_private: true,
+        }
+    }
+}
+
+fn default_ipv4_ecs_prefix() -> u8 {
+    24
+}
+
+fn default_ipv6_ecs_prefix() -> u8 {
+    56
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct BlocklistConfig {
     #[serde(default)]
     pub paths: Vec<PathBuf>,
+    #[serde(default)]
+    pub urls: Vec<String>,
+    #[serde(default)]
+    pub allowlist_paths: Vec<PathBuf>,
+    #[serde(default)]
+    pub allowlist_urls: Vec<String>,
+    #[serde(default = "default_blocklist_download_dir")]
+    pub download_dir: PathBuf,
+    #[serde(default, with = "humantime_serde")]
+    pub refresh_interval: Option<Duration>,
+    #[serde(
+        default = "default_blocklist_download_timeout",
+        with = "humantime_serde"
+    )]
+    pub download_timeout: Duration,
     #[serde(default = "default_true")]
     pub enabled: bool,
 }
@@ -214,9 +327,23 @@ impl Default for BlocklistConfig {
     fn default() -> Self {
         Self {
             paths: Vec::new(),
+            urls: Vec::new(),
+            allowlist_paths: Vec::new(),
+            allowlist_urls: Vec::new(),
+            download_dir: default_blocklist_download_dir(),
+            refresh_interval: None,
+            download_timeout: default_blocklist_download_timeout(),
             enabled: true,
         }
     }
+}
+
+fn default_blocklist_download_dir() -> PathBuf {
+    PathBuf::from("/var/lib/dotdns/blocklists")
+}
+
+fn default_blocklist_download_timeout() -> Duration {
+    Duration::from_secs(30)
 }
 
 fn default_true() -> bool {
@@ -449,9 +576,25 @@ min_ttl = "5s"
 max_ttl = "1h"
 serve_stale = true
 
+[edns]
+enabled = true
+preserve_client = true
+
+[edns.client_subnet]
+enabled = true
+ipv4_prefix = 24
+ipv6_prefix = 56
+exclude_private = true
+
 [blocklist]
 enabled = true
 paths = []
+urls = ["https://example.com/adguard-dns.txt"]
+allowlist_paths = []
+allowlist_urls = ["https://example.com/allow.txt"]
+download_dir = "/var/lib/dotdns/blocklists"
+refresh_interval = "6h"
+download_timeout = "30s"
 
 [management]
 type = "unix"
@@ -469,6 +612,69 @@ format = "json"
             Some(PathBuf::from("/etc/dotdns/cert.pem"))
         );
         assert_eq!(cfg.logging.format, LogFormat::Json);
+        assert!(cfg.edns.client_subnet.enabled);
+        assert_eq!(cfg.edns.client_subnet.ipv4_prefix, 24);
+        assert_eq!(cfg.edns.client_subnet.ipv6_prefix, 56);
+        assert_eq!(cfg.blocklist.urls.len(), 1);
+        assert_eq!(cfg.blocklist.allowlist_urls.len(), 1);
+        assert_eq!(
+            cfg.blocklist.refresh_interval,
+            Some(Duration::from_secs(6 * 60 * 60))
+        );
+    }
+
+    #[test]
+    fn reject_non_http_blocklist_url() {
+        let source = r#"
+[server]
+bind = "0.0.0.0:853"
+
+[blocklist]
+urls = ["file:///tmp/list.txt"]
+
+[[upstreams]]
+name = "cf"
+address = "1.1.1.1:53"
+"#;
+        let err = Config::from_toml(source).unwrap_err();
+        assert!(matches!(err, ConfigError::InvalidBlocklistUrl(_)));
+    }
+
+    #[test]
+    fn reject_non_http_allowlist_url() {
+        let source = r#"
+[server]
+bind = "0.0.0.0:853"
+
+[blocklist]
+allowlist_urls = ["file:///tmp/allow.txt"]
+
+[[upstreams]]
+name = "cf"
+address = "1.1.1.1:53"
+"#;
+        let err = Config::from_toml(source).unwrap_err();
+        assert!(matches!(err, ConfigError::InvalidAllowlistUrl(_)));
+    }
+
+    #[test]
+    fn reject_invalid_ecs_prefix() {
+        let source = r#"
+[server]
+bind = "0.0.0.0:853"
+
+[edns.client_subnet]
+enabled = true
+ipv4_prefix = 33
+
+[[upstreams]]
+name = "cf"
+address = "1.1.1.1:53"
+"#;
+        let err = Config::from_toml(source).unwrap_err();
+        assert!(
+            matches!(err, ConfigError::InvalidValue { field, .. } if field == "edns.client_subnet.ipv4_prefix")
+        );
     }
 
     #[test]

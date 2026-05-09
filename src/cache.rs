@@ -3,6 +3,7 @@
 use crate::config::CacheConfig;
 use crate::metrics::MetricsRecorder;
 use hickory_proto::op::Message;
+use hickory_proto::rr::rdata::opt::{EdnsCode, EdnsOption};
 use hickory_proto::rr::{DNSClass, Name, RecordType};
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -15,18 +16,27 @@ struct CacheKey {
     qclass: DNSClass,
     rd: bool,
     do_bit: bool,
+    ecs: Option<Vec<u8>>,
 }
 
 impl CacheKey {
     fn from_message(msg: &Message) -> Option<Self> {
         let q = msg.queries().first()?;
         let do_bit = msg.extensions().as_ref().map_or(false, |e| e.dnssec_ok());
+        let ecs = msg
+            .extensions()
+            .as_ref()
+            .and_then(|edns| match edns.option(EdnsCode::Subnet) {
+                Some(EdnsOption::Subnet(subnet)) => Vec::try_from(subnet).ok(),
+                _ => None,
+            });
         Some(Self {
             name: q.name().clone(),
             qtype: q.query_type(),
             qclass: q.query_class(),
             rd: msg.recursion_desired(),
             do_bit,
+            ecs,
         })
     }
 }
@@ -177,9 +187,10 @@ impl CacheInner {
 mod tests {
     use super::*;
     use hickory_proto::op::{Message, MessageType, OpCode, Query, ResponseCode};
+    use hickory_proto::rr::rdata::opt::{ClientSubnet, EdnsOption};
     use hickory_proto::rr::rdata::A;
     use hickory_proto::rr::{Name, Record, RecordType};
-    use std::net::Ipv4Addr;
+    use std::net::{IpAddr, Ipv4Addr};
     use std::str::FromStr;
 
     fn test_query(name: &str, qtype: RecordType) -> Message {
@@ -207,6 +218,13 @@ mod tests {
         msg
     }
 
+    fn add_ecs(query: &mut Message, ip: Ipv4Addr) {
+        let mut edns = query.extensions().as_ref().cloned().unwrap_or_default();
+        edns.options_mut()
+            .insert(EdnsOption::Subnet(ClientSubnet::new(IpAddr::V4(ip), 24, 0)));
+        query.set_edns(edns);
+    }
+
     #[test]
     fn cache_insert_and_get() {
         let metrics = Arc::new(MetricsRecorder::new());
@@ -225,6 +243,22 @@ mod tests {
             ttl
         );
         assert_eq!(cache.len(), 1);
+    }
+
+    #[test]
+    fn cache_key_includes_ecs() {
+        let metrics = Arc::new(MetricsRecorder::new());
+        let cache = Cache::new(CacheConfig::default(), metrics);
+        let mut query1 = test_query("example.com.", RecordType::A);
+        let mut query2 = test_query("example.com.", RecordType::A);
+        add_ecs(&mut query1, Ipv4Addr::new(8, 8, 8, 0));
+        add_ecs(&mut query2, Ipv4Addr::new(1, 1, 1, 0));
+
+        let response = test_response(&query1, 300);
+        cache.insert(&query1, &response);
+
+        assert!(cache.get(&query1).is_some());
+        assert!(cache.get(&query2).is_none());
     }
 
     #[test]

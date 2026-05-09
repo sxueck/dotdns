@@ -232,7 +232,7 @@ async fn dispatch(
             cache.flush();
             ManagementResponse::ok()
         }
-        ManagementRequest::BlocklistReload => match blocklist.reload() {
+        ManagementRequest::BlocklistReload => match blocklist.refresh_and_reload().await {
             Ok(_) => ManagementResponse::ok(),
             Err(e) => ManagementResponse::error(format!("reload failed: {e}")),
         },

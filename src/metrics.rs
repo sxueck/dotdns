@@ -70,7 +70,6 @@ impl MetricsRecorder {
     }
 }
 
-
 #[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize, Serialize)]
 pub struct MetricsSnapshot {
     pub uptime_secs: u64,

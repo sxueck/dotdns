@@ -21,7 +21,6 @@ use rustls::pki_types::ServerName;
 use std::sync::Arc as RustlsArc;
 use tokio_rustls::TlsConnector;
 
-
 #[derive(Debug, thiserror::Error, Clone)]
 pub enum UpstreamError {
     #[error("network error: {0}")]
@@ -290,7 +289,6 @@ impl DohUpstream {
 
 // --- Upstream Pool (fallback) ---
 
-
 #[derive(Debug, Clone)]
 pub struct UpstreamPool {
     upstreams: Vec<(Upstream, String)>,
@@ -329,7 +327,6 @@ impl UpstreamPool {
         self.upstreams.is_empty()
     }
 }
-
 
 pub fn pool_from_config(
     entries: &[UpstreamEntry],
