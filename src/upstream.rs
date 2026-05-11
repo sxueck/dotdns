@@ -6,10 +6,12 @@
 
 use crate::config::{UpstreamEntry, UpstreamProtocol};
 use crate::metrics::MetricsRecorder;
-use hickory_proto::op::Message;
+use hickory_proto::op::{Message, MessageType, OpCode, Query};
+use hickory_proto::rr::{Name, RData, RecordType};
 use hickory_proto::serialize::binary::{BinDecodable, BinEncodable};
 use std::error::Error;
-use std::net::{IpAddr, SocketAddr, ToSocketAddrs};
+use std::net::{IpAddr, SocketAddr, ToSocketAddrs, UdpSocket as StdUdpSocket};
+use std::str::FromStr;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -35,8 +37,6 @@ pub enum UpstreamError {
     Serialization(String),
     #[error("all upstreams failed")]
     AllFailed,
-    #[error("unsupported protocol: {0}")]
-    UnsupportedProtocol(String),
     #[error("unsupported feature: {0}")]
     UnsupportedFeature(String),
 }
@@ -93,7 +93,10 @@ pub enum Upstream {
 }
 
 impl Upstream {
-    pub fn from_entry(entry: &UpstreamEntry) -> Result<Self, UpstreamError> {
+    pub fn from_entry(
+        entry: &UpstreamEntry,
+        bootstrap_dns: &[SocketAddr],
+    ) -> Result<Self, UpstreamError> {
         if entry.tls_cert_path.is_some() {
             return Err(UpstreamError::UnsupportedFeature(
                 "tls_cert_path is not supported".into(),
@@ -101,8 +104,11 @@ impl Upstream {
         }
         match entry.protocol {
             UpstreamProtocol::Plain => Ok(Upstream::Plain(PlainUpstream::new(&entry.address))),
-            UpstreamProtocol::Tls => Ok(Upstream::Dot(DotUpstream::new(&entry.address))),
-            UpstreamProtocol::Https => Ok(Upstream::Doh(DohUpstream::new(entry)?)),
+            UpstreamProtocol::Tls => Ok(Upstream::Dot(DotUpstream::new(
+                &entry.address,
+                bootstrap_dns,
+            )?)),
+            UpstreamProtocol::Https => Ok(Upstream::Doh(DohUpstream::new(entry, bootstrap_dns)?)),
         }
     }
 
@@ -114,6 +120,7 @@ impl Upstream {
         }
     }
 
+    #[cfg(test)]
     pub fn name(&self) -> &str {
         match self {
             Upstream::Plain(u) => &u.address,
@@ -206,36 +213,62 @@ fn is_truncated(msg: &Message) -> bool {
 #[derive(Debug, Clone)]
 pub struct DotUpstream {
     address: String,
+    hostname: String,
+    endpoints: Vec<SocketAddr>,
     timeout: Duration,
     tls_config: RustlsArc<rustls::ClientConfig>,
 }
 
 impl DotUpstream {
-    pub fn new(address: &str) -> Self {
+    pub fn new(address: &str, bootstrap_dns: &[SocketAddr]) -> Result<Self, UpstreamError> {
         let mut root_store = rustls::RootCertStore::empty();
         root_store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
 
         let tls_config = rustls::ClientConfig::builder()
             .with_root_certificates(root_store)
             .with_no_client_auth();
+        let hostname = extract_host(address).to_string();
+        let port = port_from_address(address).unwrap_or(853);
+        let endpoints = resolve_host(&hostname, port, bootstrap_dns)?;
 
-        Self {
+        Ok(Self {
             address: address.to_string(),
+            hostname,
+            endpoints,
             timeout: Duration::from_secs(5),
             tls_config: RustlsArc::new(tls_config),
-        }
+        })
     }
 
     pub async fn query(&self, message: &Message) -> Result<Message, UpstreamError> {
         let msg_bytes = message.to_bytes()?;
+        let mut errors = Vec::new();
 
-        // Extract hostname for SNI (remove port).
-        let hostname = extract_host(&self.address).to_string();
+        for endpoint in &self.endpoints {
+            match self.query_endpoint(*endpoint, msg_bytes.clone()).await {
+                Ok(response) => return Ok(response),
+                Err(e) => {
+                    tracing::debug!(upstream = %self.address, endpoint = %endpoint, error = %e, "DoT endpoint failed");
+                    errors.push(format!("{}: {}", endpoint, e));
+                }
+            }
+        }
 
+        if errors.is_empty() {
+            return Err(UpstreamError::Network("no DoT endpoints configured".into()));
+        }
+        Err(UpstreamError::Network(errors.join("; ")))
+    }
+
+    async fn query_endpoint(
+        &self,
+        endpoint: SocketAddr,
+        msg_bytes: Vec<u8>,
+    ) -> Result<Message, UpstreamError> {
         tokio::time::timeout(self.timeout, async {
-            let stream = TcpStream::connect(&self.address).await?;
+            let stream = TcpStream::connect(endpoint).await?;
             let connector = TlsConnector::from(self.tls_config.clone());
-            let server_name = ServerName::try_from(hostname)
+            let server_name = ServerName::try_from(self.hostname.clone())
                 .map_err(|e| UpstreamError::Network(format!("invalid server name: {}", e)))?;
             let mut tls_stream = connector.connect(server_name, stream).await?;
 
@@ -260,40 +293,63 @@ impl DotUpstream {
 pub struct DohUpstream {
     url: String,
     timeout: Duration,
+    endpoints: Vec<DohEndpoint>,
+}
+
+#[derive(Debug, Clone)]
+struct DohEndpoint {
+    addr: SocketAddr,
     client: HttpClient,
 }
 
 impl DohUpstream {
-    pub fn new(entry: &UpstreamEntry) -> Result<Self, UpstreamError> {
+    pub fn new(entry: &UpstreamEntry, bootstrap_dns: &[SocketAddr]) -> Result<Self, UpstreamError> {
         let url = normalize_doh_url(&entry.address)?;
-        let mut builder = HttpClient::builder()
-            .https_only(true)
-            .timeout(Duration::from_secs(10));
-
         let url_parts = reqwest::Url::parse(&url)
             .map_err(|e| UpstreamError::InvalidResponse(format!("invalid DoH URL: {e}")))?;
         let host = url_parts
             .host_str()
             .ok_or_else(|| UpstreamError::InvalidResponse("DoH URL has no host".into()))?;
         let port = url_parts.port_or_known_default().unwrap_or(443);
-        let resolved_addrs = match doh_bootstrap_addrs(entry)? {
-            Some(addrs) => addrs,
-            None => resolve_doh_host(host, port)?,
-        };
-        for addr in resolved_addrs {
-            builder = builder.resolve(host, addr);
-        }
+        let resolved_addrs = resolve_host(host, port, bootstrap_dns)?;
+        let endpoints = resolved_addrs
+            .into_iter()
+            .map(|addr| build_doh_endpoint(host, addr))
+            .collect::<Result<Vec<_>, _>>()?;
 
         Ok(Self {
             url,
             timeout: Duration::from_secs(5),
-            client: builder.build().expect("reqwest client build"),
+            endpoints,
         })
     }
 
     pub async fn query(&self, message: &Message) -> Result<Message, UpstreamError> {
         let msg_bytes = message.to_bytes()?;
-        let response = self
+        let mut errors = Vec::new();
+
+        for endpoint in &self.endpoints {
+            match self.query_endpoint(endpoint, msg_bytes.clone()).await {
+                Ok(response) => return Ok(response),
+                Err(e) => {
+                    tracing::debug!(upstream = %self.url, endpoint = %endpoint.addr, error = %e, "DoH endpoint failed");
+                    errors.push(format!("{}: {}", endpoint.addr, e));
+                }
+            }
+        }
+
+        if errors.is_empty() {
+            return Err(UpstreamError::Network("no DoH endpoints configured".into()));
+        }
+        Err(UpstreamError::Network(errors.join("; ")))
+    }
+
+    async fn query_endpoint(
+        &self,
+        endpoint: &DohEndpoint,
+        msg_bytes: Vec<u8>,
+    ) -> Result<Message, UpstreamError> {
+        let response = endpoint
             .client
             .post(&self.url)
             .header("Content-Type", "application/dns-message")
@@ -304,15 +360,31 @@ impl DohUpstream {
             .await?;
 
         if !response.status().is_success() {
+            let status = response.status();
+            let body = response
+                .bytes()
+                .await
+                .map(|bytes| String::from_utf8_lossy(&bytes[..bytes.len().min(256)]).into_owned())
+                .unwrap_or_else(|e| format!("failed to read response body: {e}"));
             return Err(UpstreamError::Network(format!(
-                "HTTP error: {}",
-                response.status()
+                "HTTP error from {}: {} {}",
+                endpoint.addr, status, body
             )));
         }
 
         let resp_bytes = response.bytes().await?;
         Message::from_bytes(&resp_bytes).map_err(UpstreamError::from)
     }
+}
+
+fn build_doh_endpoint(host: &str, addr: SocketAddr) -> Result<DohEndpoint, UpstreamError> {
+    let client = HttpClient::builder()
+        .https_only(true)
+        .timeout(Duration::from_secs(10))
+        .resolve(host, addr)
+        .build()
+        .map_err(|e| UpstreamError::Network(format_error_chain(&e)))?;
+    Ok(DohEndpoint { addr, client })
 }
 
 fn normalize_doh_url(address: &str) -> Result<String, UpstreamError> {
@@ -335,61 +407,120 @@ fn normalize_doh_url(address: &str) -> Result<String, UpstreamError> {
     Ok(url.to_string())
 }
 
-fn doh_bootstrap_addrs(entry: &UpstreamEntry) -> Result<Option<Vec<SocketAddr>>, UpstreamError> {
-    let Some(value) = entry
-        .extra
-        .get("bootstrap")
-        .or_else(|| entry.extra.get("bootstrap_addrs"))
-    else {
-        return Ok(None);
-    };
-
-    let addrs = match value {
-        toml::Value::String(addr) => parse_bootstrap_addr(&entry.name, addr).map(|addr| vec![addr]),
-        toml::Value::Array(values) => values
-            .iter()
-            .map(|value| match value {
-                toml::Value::String(addr) => parse_bootstrap_addr(&entry.name, addr),
-                _ => Err(UpstreamError::InvalidResponse(format!(
-                    "upstream {} bootstrap entries must be strings",
-                    entry.name
-                ))),
-            })
-            .collect(),
-        _ => Err(UpstreamError::InvalidResponse(format!(
-            "upstream {} bootstrap must be a string or array",
-            entry.name
-        ))),
-    }?;
-    Ok(Some(addrs))
-}
-
-fn parse_bootstrap_addr(name: &str, addr: &str) -> Result<SocketAddr, UpstreamError> {
-    let with_port = if addr.contains(':') {
-        addr.to_string()
-    } else {
-        format!("{addr}:443")
-    };
-    with_port.parse().map_err(|e| {
-        UpstreamError::InvalidResponse(format!("invalid DoH bootstrap for {name}: {e}"))
-    })
-}
-
-fn resolve_doh_host(host: &str, port: u16) -> Result<Vec<SocketAddr>, UpstreamError> {
+fn resolve_host(
+    host: &str,
+    port: u16,
+    bootstrap_dns: &[SocketAddr],
+) -> Result<Vec<SocketAddr>, UpstreamError> {
     if let Ok(ip) = host.parse::<IpAddr>() {
         return Ok(vec![SocketAddr::new(ip, port)]);
     }
 
+    if !bootstrap_dns.is_empty() {
+        let ips = resolve_host_with_bootstrap(host, bootstrap_dns)?;
+        return Ok(ips
+            .into_iter()
+            .map(|ip| SocketAddr::new(ip, port))
+            .collect());
+    }
+
     let addrs: Vec<_> = (host, port)
         .to_socket_addrs()
-        .map_err(|e| UpstreamError::Network(format!("failed to resolve DoH host {host}: {e}")))?
+        .map_err(|e| UpstreamError::Network(format!("failed to resolve host {host}: {e}")))?
         .collect();
     if addrs.is_empty() {
         return Err(UpstreamError::Network(format!(
-            "failed to resolve DoH host {host}: no addresses returned"
+            "failed to resolve host {host}: no addresses returned"
         )));
     }
     Ok(addrs)
+}
+
+fn resolve_host_with_bootstrap(
+    host: &str,
+    bootstrap_dns: &[SocketAddr],
+) -> Result<Vec<IpAddr>, UpstreamError> {
+    let mut addrs = Vec::new();
+    let mut errors = Vec::new();
+
+    for server in bootstrap_dns {
+        match query_bootstrap_dns(*server, host, RecordType::A) {
+            Ok(mut ips) => addrs.append(&mut ips),
+            Err(e) => errors.push(format!("{} A: {}", server, e)),
+        }
+        match query_bootstrap_dns(*server, host, RecordType::AAAA) {
+            Ok(mut ips) => addrs.append(&mut ips),
+            Err(e) => errors.push(format!("{} AAAA: {}", server, e)),
+        }
+        if !addrs.is_empty() {
+            addrs.dedup();
+            return Ok(addrs);
+        }
+    }
+
+    if errors.is_empty() {
+        return Err(UpstreamError::Network(format!(
+            "failed to resolve host {host}: no bootstrap DNS servers configured"
+        )));
+    }
+    Err(UpstreamError::Network(format!(
+        "failed to resolve host {host} via bootstrap DNS: {}",
+        errors.join("; ")
+    )))
+}
+
+fn query_bootstrap_dns(
+    server: SocketAddr,
+    host: &str,
+    record_type: RecordType,
+) -> Result<Vec<IpAddr>, UpstreamError> {
+    let bind_addr = if server.is_ipv6() {
+        "[::]:0"
+    } else {
+        "0.0.0.0:0"
+    };
+    let socket = StdUdpSocket::bind(bind_addr)?;
+    socket.set_read_timeout(Some(Duration::from_secs(5)))?;
+    socket.set_write_timeout(Some(Duration::from_secs(5)))?;
+
+    let name = Name::from_str(host).or_else(|_| Name::from_str(&format!("{host}.")))?;
+    let mut query = Message::new();
+    query.set_id(0xD07D);
+    query.set_message_type(MessageType::Query);
+    query.set_op_code(OpCode::Query);
+    query.set_recursion_desired(true);
+    query.add_query(Query::query(name, record_type));
+
+    let bytes = query.to_bytes()?;
+    socket.send_to(&bytes, server)?;
+
+    let mut buf = vec![0u8; 65535];
+    let (len, _) = socket.recv_from(&mut buf)?;
+    buf.truncate(len);
+    let response = Message::from_bytes(&buf)?;
+    if response.message_type() != MessageType::Response {
+        return Err(UpstreamError::InvalidResponse(
+            "bootstrap DNS returned a non-response message".into(),
+        ));
+    }
+
+    let ips = response
+        .answers()
+        .iter()
+        .filter_map(|record| match record.data()? {
+            RData::A(ip) if record_type == RecordType::A => Some(IpAddr::V4(ip.0)),
+            RData::AAAA(ip) if record_type == RecordType::AAAA => Some(IpAddr::V6(ip.0)),
+            _ => None,
+        })
+        .collect();
+    Ok(ips)
+}
+
+fn port_from_address(address: &str) -> Option<u16> {
+    if address.starts_with('[') {
+        return address.rsplit_once(':')?.1.parse().ok();
+    }
+    address.rsplit_once(':')?.1.parse().ok()
 }
 
 // --- Upstream Pool (fallback) ---
@@ -423,23 +554,16 @@ impl UpstreamPool {
 
         Err(last_err.unwrap_or(UpstreamError::AllFailed))
     }
-
-    pub fn len(&self) -> usize {
-        self.upstreams.len()
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.upstreams.is_empty()
-    }
 }
 
 pub fn pool_from_config(
     entries: &[UpstreamEntry],
+    bootstrap_dns: &[SocketAddr],
     metrics: Option<Arc<MetricsRecorder>>,
 ) -> Result<UpstreamPool, UpstreamError> {
     let mut upstreams = Vec::with_capacity(entries.len());
     for entry in entries {
-        let upstream = Upstream::from_entry(entry)?;
+        let upstream = Upstream::from_entry(entry, bootstrap_dns)?;
         upstreams.push((upstream, entry.name.clone()));
     }
     Ok(UpstreamPool::new(upstreams, metrics))
@@ -452,8 +576,10 @@ pub fn pool_from_config(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use hickory_proto::op::{Message, MessageType, OpCode, Query};
-    use hickory_proto::rr::{Name, RecordType};
+    use hickory_proto::op::Message;
+    use hickory_proto::rr::rdata::A;
+    use hickory_proto::rr::Record;
+    use std::net::Ipv4Addr;
     use std::path::PathBuf;
     use std::str::FromStr;
     use std::sync::Once;
@@ -481,9 +607,12 @@ mod tests {
         msg
     }
 
-    async fn start_mock_udp_server(bind: &str) -> tokio::task::JoinHandle<()> {
+    async fn start_mock_udp_server(
+        bind: &str,
+    ) -> (tokio::task::JoinHandle<()>, std::net::SocketAddr) {
         let socket = UdpSocket::bind(bind).await.unwrap();
-        tokio::spawn(async move {
+        let addr = socket.local_addr().unwrap();
+        let handle = tokio::spawn(async move {
             let mut buf = [0u8; 512];
             loop {
                 let (len, peer) = match socket.recv_from(&mut buf).await {
@@ -499,7 +628,43 @@ mod tests {
                     let _ = socket.send_to(&bytes, peer).await;
                 }
             }
-        })
+        });
+        (handle, addr)
+    }
+
+    fn start_mock_bootstrap_server(
+        bind: &str,
+        answer: Ipv4Addr,
+    ) -> (std::thread::JoinHandle<()>, std::net::SocketAddr) {
+        let socket = std::net::UdpSocket::bind(bind).unwrap();
+        let addr = socket.local_addr().unwrap();
+        let handle = std::thread::spawn(move || {
+            let mut buf = [0u8; 512];
+            loop {
+                let (len, peer) = match socket.recv_from(&mut buf) {
+                    Ok(v) => v,
+                    Err(_) => break,
+                };
+                let mut response = match Message::from_bytes(&buf[..len]) {
+                    Ok(m) => m,
+                    Err(_) => continue,
+                };
+                response.set_message_type(MessageType::Response);
+                if let Some(q) = response.queries().first() {
+                    if q.query_type() == RecordType::A {
+                        response.add_answer(Record::from_rdata(
+                            q.name().clone(),
+                            60,
+                            RData::A(A(answer)),
+                        ));
+                    }
+                }
+                if let Ok(bytes) = response.to_bytes() {
+                    let _ = socket.send_to(&bytes, peer);
+                }
+            }
+        });
+        (handle, addr)
     }
 
     // ------------------------------------------------------------------
@@ -513,9 +678,8 @@ mod tests {
             address: "8.8.8.8:53".into(),
             protocol: UpstreamProtocol::Plain,
             tls_cert_path: None,
-            extra: Default::default(),
         };
-        let upstream = Upstream::from_entry(&entry).unwrap();
+        let upstream = Upstream::from_entry(&entry, &[]).unwrap();
         assert!(matches!(upstream, Upstream::Plain(_)));
         assert_eq!(upstream.name(), "8.8.8.8:53");
     }
@@ -528,26 +692,21 @@ mod tests {
             address: "cloudflare-dns.com:853".into(),
             protocol: UpstreamProtocol::Tls,
             tls_cert_path: None,
-            extra: Default::default(),
         };
-        let upstream = Upstream::from_entry(&entry).unwrap();
+        let upstream = Upstream::from_entry(&entry, &[]).unwrap();
         assert!(matches!(upstream, Upstream::Dot(_)));
         assert_eq!(upstream.name(), "cloudflare-dns.com:853");
     }
 
     #[test]
     fn upstream_from_doh_config() {
-        let mut entry = UpstreamEntry {
+        let entry = UpstreamEntry {
             name: "test".into(),
             address: "https://cloudflare-dns.com/dns-query".into(),
             protocol: UpstreamProtocol::Https,
             tls_cert_path: None,
-            extra: Default::default(),
         };
-        entry
-            .extra
-            .insert("bootstrap".into(), toml::Value::String("1.1.1.1".into()));
-        let upstream = Upstream::from_entry(&entry).unwrap();
+        let upstream = Upstream::from_entry(&entry, &[]).unwrap();
         assert!(matches!(upstream, Upstream::Doh(_)));
         assert_eq!(upstream.name(), "https://cloudflare-dns.com/dns-query");
     }
@@ -571,59 +730,21 @@ mod tests {
     }
 
     #[test]
-    fn doh_bootstrap_accepts_single_ip_without_port() {
-        let mut entry = UpstreamEntry {
-            name: "tencent-doh".into(),
-            address: "https://dot.pub/dns-query".into(),
-            protocol: UpstreamProtocol::Https,
-            tls_cert_path: None,
-            extra: Default::default(),
-        };
-        entry
-            .extra
-            .insert("bootstrap".into(), toml::Value::String("1.12.12.12".into()));
-
-        let addrs = doh_bootstrap_addrs(&entry).unwrap().unwrap();
-        assert_eq!(addrs, vec!["1.12.12.12:443".parse().unwrap()]);
-    }
-
-    #[test]
-    fn doh_bootstrap_accepts_array() {
-        let mut entry = UpstreamEntry {
-            name: "tencent-doh".into(),
-            address: "https://dot.pub/dns-query".into(),
-            protocol: UpstreamProtocol::Https,
-            tls_cert_path: None,
-            extra: Default::default(),
-        };
-        entry.extra.insert(
-            "bootstrap".into(),
-            toml::Value::Array(vec![
-                toml::Value::String("1.12.12.12".into()),
-                toml::Value::String("120.53.53.53:443".into()),
-            ]),
-        );
-
-        let addrs = doh_bootstrap_addrs(&entry).unwrap().unwrap();
-        assert_eq!(addrs.len(), 2);
-        assert_eq!(addrs[0], "1.12.12.12:443".parse().unwrap());
-        assert_eq!(addrs[1], "120.53.53.53:443".parse().unwrap());
-    }
-
-    #[test]
-    fn doh_bootstrap_is_optional() {
-        let entry = UpstreamEntry {
-            name: "local-doh".into(),
-            address: "https://127.0.0.1/dns-query".into(),
-            protocol: UpstreamProtocol::Https,
-            tls_cert_path: None,
-            extra: Default::default(),
-        };
-
-        assert!(doh_bootstrap_addrs(&entry).unwrap().is_none());
+    fn global_bootstrap_resolves_ip_hosts_without_dns_query() {
         assert_eq!(
-            resolve_doh_host("127.0.0.1", 443).unwrap(),
+            resolve_host("127.0.0.1", 443, &["1.1.1.1:53".parse().unwrap()]).unwrap(),
             vec!["127.0.0.1:443".parse().unwrap()]
+        );
+    }
+
+    #[test]
+    fn global_bootstrap_resolves_named_hosts() {
+        let (_handle, bootstrap_addr) =
+            start_mock_bootstrap_server("127.0.0.1:0", Ipv4Addr::new(192, 0, 2, 10));
+
+        assert_eq!(
+            resolve_host("resolver.example", 853, &[bootstrap_addr]).unwrap(),
+            vec!["192.0.2.10:853".parse().unwrap()]
         );
     }
 
@@ -634,9 +755,8 @@ mod tests {
             address: "cloudflare-dns.com:853".into(),
             protocol: UpstreamProtocol::Tls,
             tls_cert_path: Some(PathBuf::from("/some/cert.pem")),
-            extra: Default::default(),
         };
-        let err = Upstream::from_entry(&entry).unwrap_err();
+        let err = Upstream::from_entry(&entry, &[]).unwrap_err();
         assert!(matches!(err, UpstreamError::UnsupportedFeature(_)));
     }
 
@@ -655,20 +775,7 @@ mod tests {
 
     #[tokio::test]
     async fn plain_udp_query_happy_path() {
-        let handle = start_mock_udp_server("127.0.0.1:0").await;
-        // Give the mock a moment to bind.
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-
-        // Discover the bound port by trying to connect... actually we can't easily.
-        // Instead, bind to a known port.
-        let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
-        let addr = socket.local_addr().unwrap();
-        drop(socket);
-
-        // Restart mock on that port.
-        handle.abort();
-        let _handle = start_mock_udp_server(&addr.to_string()).await;
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        let (_handle, addr) = start_mock_udp_server("127.0.0.1:0").await;
 
         let upstream = PlainUpstream::new(&addr.to_string());
         let query = test_query();
@@ -690,29 +797,21 @@ mod tests {
             address: "127.0.0.1:1".into(),
             protocol: UpstreamProtocol::Plain,
             tls_cert_path: None,
-            extra: Default::default(),
         };
         let entry2 = UpstreamEntry {
             name: "ok".into(),
             address: "127.0.0.1:0".into(),
             protocol: UpstreamProtocol::Plain,
             tls_cert_path: None,
-            extra: Default::default(),
         };
 
-        // Start a mock server for entry2.
-        let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
-        let ok_addr = socket.local_addr().unwrap();
-        drop(socket);
-
-        let _handle = start_mock_udp_server(&ok_addr.to_string()).await;
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        let (_handle, ok_addr) = start_mock_udp_server("127.0.0.1:0").await;
 
         // Adjust entry2 address to the actual bound port.
         let mut entry2 = entry2;
         entry2.address = ok_addr.to_string();
 
-        let pool = pool_from_config(&[entry1, entry2], None).unwrap();
+        let pool = pool_from_config(&[entry1, entry2], &[], None).unwrap();
         let query = test_query();
 
         // First upstream (127.0.0.1:1) will fail; second should succeed.
@@ -727,10 +826,9 @@ mod tests {
             address: "127.0.0.1:1".into(),
             protocol: UpstreamProtocol::Plain,
             tls_cert_path: None,
-            extra: Default::default(),
         };
 
-        let pool = pool_from_config(&[entry.clone(), entry], None).unwrap();
+        let pool = pool_from_config(&[entry.clone(), entry], &[], None).unwrap();
         let query = test_query();
 
         let err = pool.query(&query).await.unwrap_err();
@@ -746,11 +844,10 @@ mod tests {
             address: "127.0.0.1:1".into(),
             protocol: UpstreamProtocol::Plain,
             tls_cert_path: None,
-            extra: Default::default(),
         };
 
         let metrics = Arc::new(MetricsRecorder::new());
-        let pool = pool_from_config(&[entry.clone(), entry], Some(metrics.clone())).unwrap();
+        let pool = pool_from_config(&[entry.clone(), entry], &[], Some(metrics.clone())).unwrap();
         let query = test_query();
 
         let _ = pool.query(&query).await;

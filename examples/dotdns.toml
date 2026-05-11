@@ -8,10 +8,14 @@ binds = ["0.0.0.0:853", "[::]:853"]
 idle_timeout = "60s"
 
 [tls]
-# TLS is required for DoT. Set enabled = false only for local testing without TLS.
-enabled = true
+# TLS certificate and private key are required for DoT serving.
 cert_path = "/etc/dotdns/cert.pem"
 key_path = "/etc/dotdns/key.pem"
+
+[bootstrap]
+# Global plain DNS servers used to resolve DoT/DoH upstream hostnames at startup.
+# When empty, dotdns uses the system resolver.
+dns = ["1.1.1.1:53", "1.0.0.1:53"]
 
 # Upstream resolvers are tried in order until one succeeds.
 [[upstreams]]
@@ -23,8 +27,6 @@ protocol = "dot"
 name = "cloudflare-doh"
 address = "https://cloudflare-dns.com/dns-query"
 protocol = "doh"
-# Optional override; by default dotdns resolves the DoH hostname once at startup.
-# bootstrap = ["1.1.1.1:443", "1.0.0.1:443"]
 
 [[upstreams]]
 name = "google-plain"
@@ -36,8 +38,6 @@ capacity = 10000
 # Clamp response TTLs between min and max.
 min_ttl = "5s"
 max_ttl = "1h"
-# Currently accepted but not implemented; leave false unless future releases add it.
-serve_stale = false
 
 [edns]
 enabled = true
@@ -67,6 +67,11 @@ allowlist_urls = [
 download_dir = "/var/lib/dotdns/blocklists"
 refresh_interval = "6h"
 download_timeout = "30s"
+# null_ip returns 0.0.0.0 / :: for A/AAAA to avoid DNS retry storms.
+# no_data returns NOERROR with empty answers and SOA negative caching.
+# nx_domain returns NXDOMAIN with SOA negative caching.
+response_mode = "null_ip"
+blocked_ttl = "5m"
 
 [management]
 # Local-only management. Use Unix socket by default.

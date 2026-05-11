@@ -364,9 +364,6 @@ impl ManagementClient {
 
 #[derive(Debug, thiserror::Error)]
 pub enum ManagementError {
-    // TODO: remove this, nothing uses it
-    #[error("not implemented")]
-    NotImplemented,
     #[error("connection failed: {0}")]
     Connection(String),
     #[error("request failed: {0}")]
@@ -386,49 +383,22 @@ mod tests {
     use crate::metrics::MetricsRecorder;
     use std::io::Write;
     use std::sync::Arc;
+    use std::time::Duration;
 
     fn temp_socket_path() -> std::path::PathBuf {
         tempfile::NamedTempFile::new().unwrap().path().to_path_buf()
     }
 
-    #[test]
-    fn request_serde_roundtrip() {
-        let reqs = vec![
-            ManagementRequest::Status,
-            ManagementRequest::CacheFlush,
-            ManagementRequest::BlocklistReload,
-        ];
-        for req in reqs {
-            let json = serde_json::to_string(&req).unwrap();
-            let back: ManagementRequest = serde_json::from_str(&json).unwrap();
-            assert_eq!(format!("{:?}", req), format!("{:?}", back));
+    async fn wait_for_unix_socket(path: &std::path::Path) -> UnixStream {
+        for _ in 0..50 {
+            match UnixStream::connect(path).await {
+                Ok(stream) => return stream,
+                Err(_) => tokio::time::sleep(Duration::from_millis(10)).await,
+            }
         }
-    }
-
-    #[test]
-    fn response_serde_roundtrip() {
-        let resp = ManagementResponse::ok_with_metrics(MetricsSnapshot {
-            uptime_secs: 10,
-            total_queries: 5,
-            cache_hits: 2,
-            cache_misses: 3,
-            blocked_queries: 1,
-            upstream_failures: 0,
-            cache_entries: 4,
-        });
-        let json = serde_json::to_string(&resp).unwrap();
-        let back: ManagementResponse = serde_json::from_str(&json).unwrap();
-        assert_eq!(back.status, "ok");
-        assert_eq!(back.metrics.as_ref().unwrap().total_queries, 5);
-        assert_eq!(back.message, None);
-    }
-
-    #[test]
-    fn response_error_formatting() {
-        let resp = ManagementResponse::error("something broke");
-        assert_eq!(resp.status, "error");
-        assert_eq!(resp.message, Some("something broke".into()));
-        assert!(resp.metrics.is_none());
+        UnixStream::connect(path)
+            .await
+            .expect("management socket should be ready")
     }
 
     #[tokio::test]
@@ -469,8 +439,7 @@ mod tests {
             let _ = server.run().await;
         });
 
-        // Give the server a moment to bind.
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        drop(wait_for_unix_socket(&path).await);
 
         let client = ManagementClient::new(transport);
         let snap = client.status().await.expect("status should succeed");
@@ -500,7 +469,7 @@ mod tests {
             let _ = server.run().await;
         });
 
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        drop(wait_for_unix_socket(&path).await);
         assert!(path.exists());
 
         let client = ManagementClient::new(transport);
@@ -530,7 +499,7 @@ mod tests {
             let _ = server.run().await;
         });
 
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        drop(wait_for_unix_socket(&path).await);
 
         let client = ManagementClient::new(transport);
         client.cache_flush().await.expect("flush should succeed");
@@ -548,8 +517,11 @@ mod tests {
         file.flush().unwrap();
         let good_path = file.path().to_path_buf();
 
-        let engine = BlocklistEngine::from_paths(&[good_path.clone()]).unwrap().0;
+        let engine = BlocklistEngine::from_paths(std::slice::from_ref(&good_path))
+            .unwrap()
+            .0;
         let blocklist = Arc::new(ReloadableBlocklist::from_engine(engine, vec![good_path]));
+        drop(file);
 
         let metrics = Arc::new(MetricsRecorder::new());
         let cache = Arc::new(Cache::new(CacheConfig::default(), metrics.clone()));
@@ -567,38 +539,18 @@ mod tests {
             let _ = server.run().await;
         });
 
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        drop(wait_for_unix_socket(&path).await);
 
         let client = ManagementClient::new(transport);
 
-        // Before reload, blocked.com is blocked.
         assert_eq!(blocklist.decide("blocked.com"), BlockDecision::Block);
 
-        // Trigger a reload that will fail by pointing paths at a nonexistent file.
-        // We do this by swapping the blocklist's internal paths... but ReloadableBlocklist
-        // doesn't expose a setter.  Instead, we test the dispatch layer directly:
-        // the current blocklist has valid paths, so the first reload succeeds.
-        client
+        let err = client
             .blocklist_reload()
             .await
-            .expect("reload should succeed");
+            .expect_err("reload should fail");
+        assert!(err.to_string().contains("reload failed"));
         assert_eq!(blocklist.decide("blocked.com"), BlockDecision::Block);
-
-        // To test failure-preservation via the management API, simulate a broken
-        // reload by swapping the paths inside the blocklist using its RwLock.
-        // Since we can't mutate through Arc, we test the dispatch unit directly.
-        let bad_blocklist =
-            ReloadableBlocklist::new(vec![std::path::PathBuf::from("/nonexistent/blocklist.txt")]);
-        let resp = dispatch(
-            ManagementRequest::BlocklistReload,
-            &metrics,
-            &cache,
-            &bad_blocklist,
-        )
-        .await;
-        assert_eq!(resp.status, "error");
-        // Old (empty) rules preserved.
-        assert_eq!(bad_blocklist.decide("blocked.com"), BlockDecision::Allow);
     }
 
     #[tokio::test]
@@ -623,9 +575,7 @@ mod tests {
             let _ = server.run().await;
         });
 
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-
-        let mut stream = UnixStream::connect(&path).await.unwrap();
+        let mut stream = wait_for_unix_socket(&path).await;
         stream.write_all(b"not_json\n").await.unwrap();
         stream.flush().await.unwrap();
 

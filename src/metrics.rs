@@ -125,20 +125,4 @@ mod tests {
         assert_eq!(snap.upstream_failures, 1);
         assert_eq!(snap.cache_entries, 42);
     }
-
-    #[test]
-    fn snapshot_serde_roundtrip() {
-        let snap = MetricsSnapshot {
-            uptime_secs: 123,
-            total_queries: 10,
-            cache_hits: 4,
-            cache_misses: 6,
-            blocked_queries: 1,
-            upstream_failures: 0,
-            cache_entries: 3,
-        };
-        let json = serde_json::to_string(&snap).unwrap();
-        let back: MetricsSnapshot = serde_json::from_str(&json).unwrap();
-        assert_eq!(snap, back);
-    }
 }

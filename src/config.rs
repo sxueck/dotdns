@@ -1,5 +1,4 @@
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
 use std::fmt;
 use std::net::{IpAddr, SocketAddr};
 use std::path::PathBuf;
@@ -7,8 +6,6 @@ use std::time::Duration;
 
 #[derive(Debug, Clone, thiserror::Error)]
 pub enum ConfigError {
-    #[error("missing required field: {0}")]
-    MissingField(String),
     #[error("invalid value for {field}: {message}")]
     InvalidValue { field: String, message: String },
     #[error("no upstreams configured")]
@@ -34,6 +31,8 @@ pub struct Config {
     pub tls: TlsConfig,
     #[serde(default)]
     pub upstreams: Vec<UpstreamEntry>,
+    #[serde(default)]
+    pub bootstrap: BootstrapConfig,
     #[serde(default)]
     pub cache: CacheConfig,
     #[serde(default)]
@@ -84,10 +83,16 @@ impl Config {
                 }
             }
         }
-        if self.tls.enabled {
-            if self.tls.cert_path.is_none() || self.tls.key_path.is_none() {
-                return Err(ConfigError::TlsIncomplete);
+        for (i, server) in self.bootstrap.dns.iter().enumerate() {
+            if server.port() == 0 {
+                return Err(ConfigError::InvalidValue {
+                    field: format!("bootstrap.dns[{}]", i),
+                    message: "bootstrap DNS server port must be greater than zero".into(),
+                });
             }
+        }
+        if self.tls.cert_path.is_some() != self.tls.key_path.is_some() {
+            return Err(ConfigError::TlsIncomplete);
         }
         if let ManagementTransport::Tcp { bind } = &self.management.transport {
             if !is_loopback(bind) {
@@ -126,6 +131,12 @@ impl Config {
             return Err(ConfigError::InvalidValue {
                 field: "blocklist.download_timeout".into(),
                 message: "download timeout must be greater than zero".into(),
+            });
+        }
+        if self.blocklist.blocked_ttl.is_zero() {
+            return Err(ConfigError::InvalidValue {
+                field: "blocklist.blocked_ttl".into(),
+                message: "blocked TTL must be greater than zero".into(),
             });
         }
         if self.edns.client_subnet.ipv4_prefix > 32 {
@@ -172,38 +183,21 @@ fn default_idle_timeout() -> Duration {
     Duration::from_secs(60)
 }
 
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
 pub struct TlsConfig {
-    #[serde(default)]
-    pub enabled: bool,
     pub cert_path: Option<PathBuf>,
     pub key_path: Option<PathBuf>,
 }
 
-impl Default for TlsConfig {
-    fn default() -> Self {
-        Self {
-            enabled: false,
-            cert_path: None,
-            key_path: None,
-        }
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum UpstreamProtocol {
+    #[default]
     Plain,
     #[serde(rename = "dot")]
     Tls,
     #[serde(rename = "doh")]
     Https,
-}
-
-impl Default for UpstreamProtocol {
-    fn default() -> Self {
-        UpstreamProtocol::Plain
-    }
 }
 
 impl fmt::Display for UpstreamProtocol {
@@ -217,14 +211,19 @@ impl fmt::Display for UpstreamProtocol {
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct UpstreamEntry {
     pub name: String,
     pub address: String,
     #[serde(default)]
     pub protocol: UpstreamProtocol,
     pub tls_cert_path: Option<PathBuf>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+pub struct BootstrapConfig {
     #[serde(default)]
-    pub extra: HashMap<String, toml::Value>,
+    pub dns: Vec<SocketAddr>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -235,9 +234,6 @@ pub struct CacheConfig {
     pub min_ttl: Option<Duration>,
     #[serde(default, with = "humantime_serde")]
     pub max_ttl: Option<Duration>,
-    // TODO: actually implement stale serving
-    #[serde(default)]
-    pub serve_stale: bool,
 }
 
 fn default_cache_capacity() -> usize {
@@ -250,7 +246,6 @@ impl Default for CacheConfig {
             capacity: default_cache_capacity(),
             min_ttl: None,
             max_ttl: None,
-            serve_stale: false,
         }
     }
 }
@@ -327,6 +322,10 @@ pub struct BlocklistConfig {
     pub download_timeout: Duration,
     #[serde(default = "default_true")]
     pub enabled: bool,
+    #[serde(default)]
+    pub response_mode: BlocklistResponseMode,
+    #[serde(default = "default_blocked_ttl", with = "humantime_serde")]
+    pub blocked_ttl: Duration,
 }
 
 impl Default for BlocklistConfig {
@@ -340,8 +339,19 @@ impl Default for BlocklistConfig {
             refresh_interval: None,
             download_timeout: default_blocklist_download_timeout(),
             enabled: true,
+            response_mode: BlocklistResponseMode::default(),
+            blocked_ttl: default_blocked_ttl(),
         }
     }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BlocklistResponseMode {
+    #[default]
+    NullIp,
+    NoData,
+    NxDomain,
 }
 
 fn default_blocklist_download_dir() -> PathBuf {
@@ -352,22 +362,18 @@ fn default_blocklist_download_timeout() -> Duration {
     Duration::from_secs(30)
 }
 
+fn default_blocked_ttl() -> Duration {
+    Duration::from_secs(300)
+}
+
 fn default_true() -> bool {
     true
 }
 
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
 pub struct ManagementConfig {
     #[serde(flatten, default)]
     pub transport: ManagementTransport,
-}
-
-impl Default for ManagementConfig {
-    fn default() -> Self {
-        Self {
-            transport: ManagementTransport::default(),
-        }
-    }
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -434,6 +440,7 @@ protocol = "plain"
         let cfg = Config::from_toml(source).unwrap();
         assert_eq!(cfg.server.binds.len(), 2);
         assert_eq!(cfg.server.binds[0].port(), 853);
+        assert!(cfg.bootstrap.dns.is_empty());
         assert_eq!(cfg.upstreams.len(), 1);
         assert_eq!(cfg.upstreams[0].protocol, UpstreamProtocol::Plain);
     }
@@ -464,13 +471,13 @@ protocol = "plain"
     }
 
     #[test]
-    fn reject_missing_tls_files_when_enabled() {
+    fn reject_missing_tls_files_when_partial() {
         let source = r#"
 [server]
 binds = ["0.0.0.0:853"]
 
 [tls]
-enabled = true
+cert_path = "/etc/dotdns/cert.pem"
 
 [[upstreams]]
 name = "cf"
@@ -578,9 +585,11 @@ binds = ["0.0.0.0:853"]
 idle_timeout = "2m"
 
 [tls]
-enabled = true
 cert_path = "/etc/dotdns/cert.pem"
 key_path = "/etc/dotdns/key.pem"
+
+[bootstrap]
+dns = ["1.1.1.1:53", "1.0.0.1:53"]
 
 [[upstreams]]
 name = "cloudflare-dot"
@@ -596,7 +605,6 @@ protocol = "doh"
 capacity = 50000
 min_ttl = "5s"
 max_ttl = "1h"
-serve_stale = true
 
 [edns]
 enabled = true
@@ -617,6 +625,8 @@ allowlist_urls = ["https://example.com/allow.txt"]
 download_dir = "/var/lib/dotdns/blocklists"
 refresh_interval = "6h"
 download_timeout = "30s"
+response_mode = "no_data"
+blocked_ttl = "10m"
 
 [management]
 type = "unix"
@@ -643,6 +653,44 @@ format = "json"
             cfg.blocklist.refresh_interval,
             Some(Duration::from_secs(6 * 60 * 60))
         );
+        assert_eq!(cfg.blocklist.response_mode, BlocklistResponseMode::NoData);
+        assert_eq!(cfg.blocklist.blocked_ttl, Duration::from_secs(600));
+        assert_eq!(cfg.bootstrap.dns.len(), 2);
+    }
+
+    #[test]
+    fn reject_zero_port_bootstrap_dns() {
+        let source = r#"
+[server]
+binds = ["0.0.0.0:853"]
+
+[bootstrap]
+dns = ["1.1.1.1:0"]
+
+[[upstreams]]
+name = "cf"
+address = "1.1.1.1:53"
+"#;
+        let err = Config::from_toml(source).unwrap_err();
+        assert!(
+            matches!(err, ConfigError::InvalidValue { field, .. } if field == "bootstrap.dns[0]")
+        );
+    }
+
+    #[test]
+    fn reject_per_upstream_bootstrap_dns() {
+        let source = r#"
+[server]
+binds = ["0.0.0.0:853"]
+
+[[upstreams]]
+name = "cloudflare-doh"
+address = "https://cloudflare-dns.com/dns-query"
+protocol = "doh"
+bootstrap = ["1.1.1.1:53"]
+"#;
+        let err = Config::from_toml(source).unwrap_err();
+        assert!(matches!(err, ConfigError::InvalidValue { field, .. } if field == "config"));
     }
 
     #[test]
@@ -705,8 +753,10 @@ address = "1.1.1.1:53"
         assert_eq!(cfg.server.binds.len(), 2);
         assert_eq!(cfg.server.binds[0].port(), 853);
         assert_eq!(cfg.server.binds[1].port(), 853);
-        assert!(cfg.tls.enabled);
+        assert!(cfg.tls.cert_path.is_some());
+        assert!(cfg.tls.key_path.is_some());
         assert_eq!(cfg.upstreams.len(), 3);
+        assert_eq!(cfg.bootstrap.dns.len(), 2);
         assert_eq!(cfg.upstreams[0].protocol, UpstreamProtocol::Tls);
         assert_eq!(cfg.upstreams[1].protocol, UpstreamProtocol::Https);
         assert_eq!(cfg.upstreams[2].protocol, UpstreamProtocol::Plain);

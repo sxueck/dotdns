@@ -2,21 +2,23 @@
 
 use crate::blocklist::ReloadableBlocklist;
 use crate::cache::Cache;
-use crate::config::{Config, EdnsConfig};
+use crate::config::{BlocklistConfig, BlocklistResponseMode, Config, EdnsConfig};
 use crate::metrics::MetricsRecorder;
 use crate::upstream::{UpstreamError, UpstreamPool};
 use hickory_proto::op::{Edns, Message, MessageType, ResponseCode};
 use hickory_proto::rr::rdata::opt::{ClientSubnet, EdnsCode, EdnsOption};
-use hickory_proto::rr::rdata::{A, AAAA};
+use hickory_proto::rr::rdata::{A, AAAA, SOA};
 use hickory_proto::rr::{Record, RecordType};
 use hickory_proto::serialize::binary::{BinDecodable, BinEncodable};
 use socket2::{Domain, Protocol, Socket, Type};
+use std::collections::HashMap;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
+use tokio::sync::{watch, Mutex};
 use tokio_rustls::TlsAcceptor;
 
 #[derive(Debug, thiserror::Error)]
@@ -37,6 +39,64 @@ impl From<UpstreamError> for ServerError {
     }
 }
 
+type PendingResult = Result<Message, UpstreamError>;
+
+#[derive(Debug, Clone, Default)]
+pub(crate) struct PendingQueries {
+    inner: Arc<Mutex<HashMap<Vec<u8>, PendingEntry>>>,
+}
+
+#[derive(Debug, Clone)]
+struct PendingEntry {
+    tx: watch::Sender<Option<PendingResult>>,
+    rx: watch::Receiver<Option<PendingResult>>,
+}
+
+fn pending_key(query: &Message) -> Result<Vec<u8>, UpstreamError> {
+    let mut clone = query.clone();
+    clone.set_id(0);
+    clone.to_bytes().map_err(UpstreamError::from)
+}
+
+impl PendingQueries {
+    async fn query(&self, pool: &UpstreamPool, query: &Message) -> PendingResult {
+        let key = pending_key(query)?;
+        let (leader, mut rx) = {
+            let mut inner = self.inner.lock().await;
+            if let Some(entry) = inner.get(&key) {
+                (false, entry.rx.clone())
+            } else {
+                let (tx, rx) = watch::channel(None);
+                inner.insert(key.clone(), PendingEntry { tx, rx: rx.clone() });
+                (true, rx)
+            }
+        };
+
+        if !leader {
+            loop {
+                if let Some(result) = rx.borrow().clone() {
+                    return result;
+                }
+                if rx.changed().await.is_err() {
+                    return Err(UpstreamError::Network(
+                        "pending upstream request was cancelled".into(),
+                    ));
+                }
+            }
+        }
+
+        let result = pool.query(query).await;
+        let tx = {
+            let mut inner = self.inner.lock().await;
+            inner.remove(&key).map(|entry| entry.tx)
+        };
+        if let Some(tx) = tx {
+            let _ = tx.send(Some(result.clone()));
+        }
+        result
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct Server {
     config: Arc<Config>,
@@ -44,6 +104,7 @@ pub struct Server {
     cache: Arc<Cache>,
     blocklist: Arc<ReloadableBlocklist>,
     pool: UpstreamPool,
+    pending: PendingQueries,
 }
 
 impl Server {
@@ -60,6 +121,7 @@ impl Server {
             cache,
             blocklist,
             pool,
+            pending: PendingQueries::default(),
         }
     }
 
@@ -76,21 +138,19 @@ impl Server {
         let mut tasks = tokio::task::JoinSet::new();
 
         for listener in listeners {
-            let acceptor = acceptor.clone();
-            let metrics = self.metrics.clone();
-            let cache = self.cache.clone();
-            let blocklist = self.blocklist.clone();
-            let pool = self.pool.clone();
-            let edns = self.config.edns.clone();
             tasks.spawn(accept_loop(
                 listener,
-                acceptor,
-                metrics,
-                cache,
-                blocklist,
-                pool,
-                edns,
-                idle_timeout,
+                ConnectionContext {
+                    acceptor: acceptor.clone(),
+                    metrics: self.metrics.clone(),
+                    cache: self.cache.clone(),
+                    blocklist: self.blocklist.clone(),
+                    pool: self.pool.clone(),
+                    pending: self.pending.clone(),
+                    edns: self.config.edns.clone(),
+                    blocklist_config: self.config.blocklist.clone(),
+                    idle_timeout,
+                },
             ));
         }
 
@@ -117,9 +177,6 @@ pub fn validate_tls_config(config: &Config) -> Result<(), ServerError> {
 }
 
 fn build_tls_server_config(config: &Config) -> Result<rustls::ServerConfig, ServerError> {
-    if !config.tls.enabled {
-        return Err(ServerError::Tls("TLS is not enabled in config".into()));
-    }
     let cert_path = config
         .tls
         .cert_path
@@ -146,39 +203,26 @@ fn build_tls_server_config(config: &Config) -> Result<rustls::ServerConfig, Serv
         .map_err(|e| ServerError::Tls(e.to_string()))
 }
 
-async fn accept_loop(
-    listener: TcpListener,
+#[derive(Clone)]
+struct ConnectionContext {
     acceptor: TlsAcceptor,
     metrics: Arc<MetricsRecorder>,
     cache: Arc<Cache>,
     blocklist: Arc<ReloadableBlocklist>,
     pool: UpstreamPool,
+    pending: PendingQueries,
     edns: EdnsConfig,
+    blocklist_config: BlocklistConfig,
     idle_timeout: Duration,
-) -> Result<(), ServerError> {
+}
+
+async fn accept_loop(listener: TcpListener, ctx: ConnectionContext) -> Result<(), ServerError> {
     loop {
         let (stream, peer) = listener.accept().await?;
-        let acceptor = acceptor.clone();
-        let metrics = metrics.clone();
-        let cache = cache.clone();
-        let blocklist = blocklist.clone();
-        let pool = pool.clone();
-        let edns = edns.clone();
+        let conn_ctx = ctx.clone();
 
         tokio::spawn(async move {
-            if let Err(e) = handle_connection(
-                stream,
-                acceptor,
-                peer,
-                metrics,
-                cache,
-                blocklist,
-                pool,
-                edns,
-                idle_timeout,
-            )
-            .await
-            {
+            if let Err(e) = handle_connection(stream, peer, conn_ctx).await {
                 tracing::debug!(peer = %peer, error = %e, "connection closed");
             }
         });
@@ -220,34 +264,30 @@ fn load_key(path: &Path) -> Result<rustls::pki_types::PrivateKeyDer<'static>, Se
 
 async fn handle_connection(
     stream: TcpStream,
-    acceptor: TlsAcceptor,
     peer: SocketAddr,
-    metrics: Arc<MetricsRecorder>,
-    cache: Arc<Cache>,
-    blocklist: Arc<ReloadableBlocklist>,
-    pool: UpstreamPool,
-    edns: EdnsConfig,
-    idle_timeout: Duration,
+    ctx: ConnectionContext,
 ) -> Result<(), ServerError> {
-    let mut tls_stream = acceptor
+    let mut tls_stream = ctx
+        .acceptor
         .accept(stream)
         .await
         .map_err(|e| ServerError::Tls(e.to_string()))?;
 
     loop {
-        match read_message(&mut tls_stream, idle_timeout).await {
+        match read_message(&mut tls_stream, ctx.idle_timeout).await {
             Ok(Some(query)) => {
-                let response = resolve_with_context(
-                    query,
-                    &metrics,
-                    &cache,
-                    &blocklist,
-                    &pool,
-                    Some(peer.ip()),
-                    &edns,
-                )
-                .await;
-                if let Err(e) = write_message(&mut tls_stream, &response, idle_timeout).await {
+                let resolve_ctx = ResolveContext {
+                    metrics: &ctx.metrics,
+                    cache: &ctx.cache,
+                    blocklist: &ctx.blocklist,
+                    pool: &ctx.pool,
+                    pending: &ctx.pending,
+                    client_ip: Some(peer.ip()),
+                    edns: &ctx.edns,
+                    blocklist_config: &ctx.blocklist_config,
+                };
+                let response = resolve_with_context(query, &resolve_ctx).await;
+                if let Err(e) = write_message(&mut tls_stream, &response, ctx.idle_timeout).await {
                     tracing::debug!(error = %e, "write error");
                     break;
                 }
@@ -305,7 +345,19 @@ async fn write_message<W: AsyncWriteExt + Unpin>(
     Ok(())
 }
 
+pub(crate) struct ResolveContext<'a> {
+    pub(crate) metrics: &'a MetricsRecorder,
+    pub(crate) cache: &'a Cache,
+    pub(crate) blocklist: &'a ReloadableBlocklist,
+    pub(crate) pool: &'a UpstreamPool,
+    pub(crate) pending: &'a PendingQueries,
+    pub(crate) client_ip: Option<IpAddr>,
+    pub(crate) edns: &'a EdnsConfig,
+    pub(crate) blocklist_config: &'a BlocklistConfig,
+}
+
 /// Main resolve path.
+#[cfg(test)]
 pub async fn resolve(
     query: Message,
     metrics: &MetricsRecorder,
@@ -315,26 +367,22 @@ pub async fn resolve(
 ) -> Message {
     resolve_with_context(
         query,
-        metrics,
-        cache,
-        blocklist,
-        pool,
-        None,
-        &EdnsConfig::default(),
+        &ResolveContext {
+            metrics,
+            cache,
+            blocklist,
+            pool,
+            pending: &PendingQueries::default(),
+            client_ip: None,
+            edns: &EdnsConfig::default(),
+            blocklist_config: &BlocklistConfig::default(),
+        },
     )
     .await
 }
 
-pub async fn resolve_with_context(
-    query: Message,
-    metrics: &MetricsRecorder,
-    cache: &Cache,
-    blocklist: &ReloadableBlocklist,
-    pool: &UpstreamPool,
-    client_ip: Option<IpAddr>,
-    edns: &EdnsConfig,
-) -> Message {
-    metrics.record_query();
+pub(crate) async fn resolve_with_context(query: Message, ctx: &ResolveContext<'_>) -> Message {
+    ctx.metrics.record_query();
 
     let q = match query.queries().first() {
         Some(q) => q,
@@ -347,49 +395,28 @@ pub async fn resolve_with_context(
     let domain = domain.trim_end_matches('.');
 
     // Blocklist check
-    if blocklist.decide(domain).is_blocked() {
-        metrics.record_blocked();
-        let mut resp = Message::new();
-        apply_query_meta(&query, &mut resp);
-        resp.set_response_code(ResponseCode::NoError);
-        match q.query_type() {
-            RecordType::A => {
-                let record = Record::from_rdata(
-                    q.name().clone(),
-                    0,
-                    hickory_proto::rr::RData::A(A(Ipv4Addr::new(0, 0, 0, 0))),
-                );
-                resp.add_answer(record);
-            }
-            RecordType::AAAA => {
-                let record = Record::from_rdata(
-                    q.name().clone(),
-                    0,
-                    hickory_proto::rr::RData::AAAA(AAAA(Ipv6Addr::new(0, 0, 0, 0, 0, 0, 0, 0))),
-                );
-                resp.add_answer(record);
-            }
-            _ => {}
-        }
-        return resp;
+    if ctx.blocklist.decide(domain).is_blocked() {
+        ctx.metrics.record_blocked();
+        return make_blocked_response(&query, ctx.blocklist_config);
     }
 
-    let upstream_query = query_with_ecs(&query, client_ip, edns);
+    let upstream_query = query_with_ecs(&query, ctx.client_ip, ctx.edns);
 
     // Cache check
-    if let Some(cached) = cache.get(&upstream_query) {
-        metrics.record_cache_hit();
+    if let Some(cached) = ctx.cache.get(&upstream_query) {
+        ctx.metrics.record_cache_hit();
         let mut resp = cached;
         resp.set_id(query.id());
         return resp;
     }
 
-    metrics.record_cache_miss();
+    ctx.metrics.record_cache_miss();
 
     // Forward to upstream
-    match pool.query(&upstream_query).await {
-        Ok(response) => {
-            cache.insert(&upstream_query, &response);
+    match ctx.pending.query(ctx.pool, &upstream_query).await {
+        Ok(mut response) => {
+            response.set_id(query.id());
+            ctx.cache.insert(&upstream_query, &response);
             response
         }
         Err(e) => {
@@ -484,6 +511,62 @@ where
     value & (!T::from(0) << (total_bits - prefix))
 }
 
+fn make_blocked_response(query: &Message, config: &BlocklistConfig) -> Message {
+    let mut resp = Message::new();
+    apply_query_meta(query, &mut resp);
+    let ttl = config.blocked_ttl.as_secs().min(u32::MAX as u64) as u32;
+    let Some(q) = query.queries().first() else {
+        resp.set_response_code(ResponseCode::FormErr);
+        return resp;
+    };
+
+    match config.response_mode {
+        BlocklistResponseMode::NullIp => {
+            resp.set_response_code(ResponseCode::NoError);
+            match q.query_type() {
+                RecordType::A => {
+                    resp.add_answer(Record::from_rdata(
+                        q.name().clone(),
+                        ttl,
+                        hickory_proto::rr::RData::A(A(Ipv4Addr::new(0, 0, 0, 0))),
+                    ));
+                }
+                RecordType::AAAA => {
+                    resp.add_answer(Record::from_rdata(
+                        q.name().clone(),
+                        ttl,
+                        hickory_proto::rr::RData::AAAA(AAAA(Ipv6Addr::UNSPECIFIED)),
+                    ));
+                }
+                _ => add_blocked_soa(&mut resp, q.name().clone(), ttl),
+            }
+        }
+        BlocklistResponseMode::NoData => {
+            resp.set_response_code(ResponseCode::NoError);
+            add_blocked_soa(&mut resp, q.name().clone(), ttl);
+        }
+        BlocklistResponseMode::NxDomain => {
+            resp.set_response_code(ResponseCode::NXDomain);
+            add_blocked_soa(&mut resp, q.name().clone(), ttl);
+        }
+    }
+
+    resp
+}
+
+fn add_blocked_soa(response: &mut Message, name: hickory_proto::rr::Name, ttl: u32) {
+    let mname =
+        hickory_proto::rr::Name::from_ascii("blocked.dotdns.").expect("static SOA mname is valid");
+    let rname = hickory_proto::rr::Name::from_ascii("hostmaster.blocked.dotdns.")
+        .expect("static SOA rname is valid");
+    let soa = SOA::new(mname, rname, 1, 1800, 900, 604800, ttl);
+    response.add_name_server(Record::from_rdata(
+        name,
+        ttl,
+        hickory_proto::rr::RData::SOA(soa),
+    ));
+}
+
 fn make_error_response(query: &Message, code: ResponseCode) -> Message {
     let mut resp = Message::new();
     apply_query_meta(query, &mut resp);
@@ -513,6 +596,7 @@ mod tests {
     use hickory_proto::rr::{Name, RecordType};
     use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
     use std::str::FromStr;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
     use tokio::net::UdpSocket;
 
@@ -648,6 +732,42 @@ mod tests {
         (handle, addr)
     }
 
+    async fn start_counting_udp_server(
+        bind: &str,
+        count: Arc<AtomicUsize>,
+    ) -> (tokio::task::JoinHandle<()>, std::net::SocketAddr) {
+        let socket = UdpSocket::bind(bind).await.unwrap();
+        let addr = socket.local_addr().unwrap();
+        let handle = tokio::spawn(async move {
+            let mut buf = [0u8; 512];
+            loop {
+                let (len, peer) = match socket.recv_from(&mut buf).await {
+                    Ok(v) => v,
+                    Err(_) => break,
+                };
+                count.fetch_add(1, Ordering::SeqCst);
+                tokio::time::sleep(Duration::from_millis(100)).await;
+                let mut response = match Message::from_bytes(&buf[..len]) {
+                    Ok(m) => m,
+                    Err(_) => continue,
+                };
+                response.set_message_type(MessageType::Response);
+                if let Some(q) = response.queries().first() {
+                    let record = Record::from_rdata(
+                        q.name().clone(),
+                        300,
+                        hickory_proto::rr::RData::A(A(Ipv4Addr::new(127, 0, 0, 1))),
+                    );
+                    response.add_answer(record);
+                }
+                if let Ok(bytes) = response.to_bytes() {
+                    let _ = socket.send_to(&bytes, peer).await;
+                }
+            }
+        });
+        (handle, addr)
+    }
+
     #[tokio::test]
     async fn resolver_blocklist_before_upstream() {
         let mut engine = BlocklistEngine::empty();
@@ -656,15 +776,13 @@ mod tests {
         let metrics = Arc::new(MetricsRecorder::new());
         let cache = Arc::new(Cache::new(CacheConfig::default(), metrics.clone()));
 
-        // Upstream that will fail if contacted.
         let entry = UpstreamEntry {
             name: "fail".into(),
             address: "127.0.0.1:1".into(),
             protocol: UpstreamProtocol::Plain,
             tls_cert_path: None,
-            extra: Default::default(),
         };
-        let pool = pool_from_config(&[entry], None).unwrap();
+        let pool = pool_from_config(&[entry], &[], None).unwrap();
 
         let query = test_query("blocked.com.", RecordType::A);
         let resp = resolve(query, &metrics, &cache, &blocklist, &pool).await;
@@ -674,7 +792,7 @@ mod tests {
         let snap = metrics.snapshot();
         assert_eq!(snap.blocked_queries, 1);
         assert_eq!(snap.total_queries, 1);
-        assert_eq!(snap.upstream_failures, 0); // blocklist prevented upstream call
+        assert_eq!(snap.upstream_failures, 0);
     }
 
     #[tokio::test]
@@ -727,34 +845,138 @@ mod tests {
 
         assert_eq!(resp.response_code(), ResponseCode::NoError);
         assert_eq!(resp.answers().len(), 0);
+        assert_eq!(resp.name_servers().len(), 1);
+    }
+
+    #[test]
+    fn blocked_no_data_uses_soa_negative_cache() {
+        let query = test_query("blocked.com.", RecordType::A);
+        let config = BlocklistConfig {
+            response_mode: BlocklistResponseMode::NoData,
+            blocked_ttl: Duration::from_secs(60),
+            ..BlocklistConfig::default()
+        };
+
+        let resp = make_blocked_response(&query, &config);
+
+        assert_eq!(resp.response_code(), ResponseCode::NoError);
+        assert!(resp.answers().is_empty());
+        assert_eq!(resp.name_servers().len(), 1);
+        assert_eq!(resp.name_servers()[0].ttl(), 60);
+        assert!(matches!(
+            resp.name_servers()[0].data().unwrap(),
+            hickory_proto::rr::RData::SOA(_)
+        ));
+    }
+
+    #[test]
+    fn blocked_nx_domain_uses_soa_negative_cache() {
+        let query = test_query("blocked.com.", RecordType::A);
+        let config = BlocklistConfig {
+            response_mode: BlocklistResponseMode::NxDomain,
+            blocked_ttl: Duration::from_secs(120),
+            ..BlocklistConfig::default()
+        };
+
+        let resp = make_blocked_response(&query, &config);
+
+        assert_eq!(resp.response_code(), ResponseCode::NXDomain);
+        assert!(resp.answers().is_empty());
+        assert_eq!(resp.name_servers()[0].ttl(), 120);
     }
 
     #[tokio::test]
-    async fn resolver_cache_hit_miss() {
-        let (_handle, addr) = start_mock_udp_server("127.0.0.1:0").await;
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    async fn pending_queries_share_single_upstream_request() {
+        let count = Arc::new(AtomicUsize::new(0));
+        let (_handle, addr) = start_counting_udp_server("127.0.0.1:0", count.clone()).await;
 
         let entry = UpstreamEntry {
             name: "mock".into(),
             address: addr.to_string(),
             protocol: UpstreamProtocol::Plain,
             tls_cert_path: None,
-            extra: Default::default(),
+        };
+        let pool = pool_from_config(&[entry], &[], None).unwrap();
+        let pending = PendingQueries::default();
+        let mut query1 = test_query("example.com.", RecordType::A);
+        query1.set_id(1000);
+        let mut query2 = test_query("example.com.", RecordType::A);
+        query2.set_id(2000);
+
+        let (first, second) =
+            tokio::join!(pending.query(&pool, &query1), pending.query(&pool, &query2));
+
+        assert!(first.unwrap().answers().len() == 1);
+        assert!(second.unwrap().answers().len() == 1);
+        assert_eq!(count.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn resolver_coalesces_different_ids_and_preserves_them() {
+        let count = Arc::new(AtomicUsize::new(0));
+        let (_handle, addr) = start_counting_udp_server("127.0.0.1:0", count.clone()).await;
+
+        let entry = UpstreamEntry {
+            name: "mock".into(),
+            address: addr.to_string(),
+            protocol: UpstreamProtocol::Plain,
+            tls_cert_path: None,
         };
         let metrics = Arc::new(MetricsRecorder::new());
         let cache = Arc::new(Cache::new(CacheConfig::default(), metrics.clone()));
         let blocklist = Arc::new(ReloadableBlocklist::new(vec![]));
-        let pool = pool_from_config(&[entry], None).unwrap();
+        let pool = pool_from_config(&[entry], &[], None).unwrap();
+        let pending = PendingQueries::default();
+        let edns = EdnsConfig::default();
+        let blocklist_config = BlocklistConfig::default();
+
+        let mut query1 = test_query("example.com.", RecordType::A);
+        query1.set_id(1234);
+        let mut query2 = test_query("example.com.", RecordType::A);
+        query2.set_id(5678);
+
+        let ctx = ResolveContext {
+            metrics: &metrics,
+            cache: &cache,
+            blocklist: &blocklist,
+            pool: &pool,
+            pending: &pending,
+            client_ip: None,
+            edns: &edns,
+            blocklist_config: &blocklist_config,
+        };
+        let (resp1, resp2) = tokio::join!(
+            resolve_with_context(query1.clone(), &ctx),
+            resolve_with_context(query2.clone(), &ctx),
+        );
+
+        assert_eq!(count.load(Ordering::SeqCst), 1);
+        assert_eq!(resp1.id(), query1.id());
+        assert_eq!(resp2.id(), query2.id());
+    }
+
+    #[tokio::test]
+    async fn resolver_cache_hit_miss() {
+        let (_handle, addr) = start_mock_udp_server("127.0.0.1:0").await;
+
+        let entry = UpstreamEntry {
+            name: "mock".into(),
+            address: addr.to_string(),
+            protocol: UpstreamProtocol::Plain,
+            tls_cert_path: None,
+        };
+        let metrics = Arc::new(MetricsRecorder::new());
+        let cache = Arc::new(Cache::new(CacheConfig::default(), metrics.clone()));
+        let blocklist = Arc::new(ReloadableBlocklist::new(vec![]));
+        let pool = pool_from_config(&[entry], &[], None).unwrap();
 
         let query = test_query("example.com.", RecordType::A);
-        // First query -> miss
         let resp1 = resolve(query.clone(), &metrics, &cache, &blocklist, &pool).await;
         assert_eq!(resp1.message_type(), MessageType::Response);
         let snap = metrics.snapshot();
         assert_eq!(snap.cache_misses, 1);
         assert_eq!(snap.cache_hits, 0);
 
-        // Second query -> hit
         let resp2 = resolve(query.clone(), &metrics, &cache, &blocklist, &pool).await;
         assert_eq!(resp2.message_type(), MessageType::Response);
         let snap = metrics.snapshot();
@@ -764,25 +986,21 @@ mod tests {
     #[tokio::test]
     async fn resolver_preserves_edns() {
         let (_handle, addr) = start_mock_udp_server("127.0.0.1:0").await;
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
 
         let entry = UpstreamEntry {
             name: "mock".into(),
             address: addr.to_string(),
             protocol: UpstreamProtocol::Plain,
             tls_cert_path: None,
-            extra: Default::default(),
         };
         let metrics = Arc::new(MetricsRecorder::new());
         let cache = Arc::new(Cache::new(CacheConfig::default(), metrics.clone()));
         let blocklist = Arc::new(ReloadableBlocklist::new(vec![]));
-        let pool = pool_from_config(&[entry], None).unwrap();
+        let pool = pool_from_config(&[entry], &[], None).unwrap();
 
         let query = test_query_with_edns("example.com.", RecordType::A);
         let resp = resolve(query.clone(), &metrics, &cache, &blocklist, &pool).await;
 
-        // Response should have EDNS because the mock echoes the query (which had EDNS)
-        // and resolve preserves it.
         assert!(resp.extensions().as_ref().is_some());
     }
 }

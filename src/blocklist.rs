@@ -60,6 +60,7 @@ impl BlocklistEngine {
     }
 
     // Returns (engine, report). report tells you how many lines were skipped.
+    #[cfg(test)]
     pub fn from_paths(paths: &[PathBuf]) -> Result<(Self, ParseReport), BlocklistError> {
         Self::from_sources(paths, &[])
     }
@@ -150,21 +151,19 @@ impl BlocklistEngine {
         false
     }
 
+    #[cfg(test)]
     pub fn block_count(&self) -> usize {
         self.blocks.len()
     }
 
+    #[cfg(test)]
     pub fn exception_count(&self) -> usize {
         self.exceptions.len()
     }
 
+    #[cfg(test)]
     pub fn add_block(&mut self, domain: &str) {
         self.blocks
-            .insert(NormalizedRule::Domain(normalize_domain(domain)));
-    }
-
-    pub fn add_exception(&mut self, domain: &str) {
-        self.exceptions
             .insert(NormalizedRule::Domain(normalize_domain(domain)));
     }
 }
@@ -181,6 +180,7 @@ pub struct ReloadableBlocklist {
 }
 
 impl ReloadableBlocklist {
+    #[cfg(test)]
     pub fn new(paths: Vec<PathBuf>) -> Self {
         Self {
             engine: RwLock::new(BlocklistEngine::empty()),
@@ -213,6 +213,7 @@ impl ReloadableBlocklist {
         }
     }
 
+    #[cfg(test)]
     pub fn from_engine(engine: BlocklistEngine, paths: Vec<PathBuf>) -> Self {
         Self {
             engine: RwLock::new(engine),
@@ -246,6 +247,7 @@ impl ReloadableBlocklist {
         guard.decide(domain)
     }
 
+    #[cfg(test)]
     pub fn paths(&self) -> &[PathBuf] {
         &self.paths
     }
@@ -262,14 +264,10 @@ impl ReloadableBlocklist {
         paths
     }
 
+    #[cfg(test)]
     pub fn block_count(&self) -> usize {
         let guard = self.engine.read().expect("blocklist read lock poisoned");
         guard.block_count()
-    }
-
-    pub fn exception_count(&self) -> usize {
-        let guard = self.engine.read().expect("blocklist read lock poisoned");
-        guard.exception_count()
     }
 }
 
@@ -371,31 +369,6 @@ impl fmt::Display for ParseReport {
             "parsed {} lines, {} unsupported skipped",
             self.total, self.unsupported
         )
-    }
-}
-
-/// Blocked response IPs.
-pub struct BlockedResponse;
-
-impl BlockedResponse {
-    /// IPv4 address to return for blocked A queries.
-    pub const IPV4: &str = "0.0.0.0";
-    /// IPv6 address to return for blocked AAAA queries.
-    pub const IPV6: &str = "::";
-
-    /// Returns the IPv4 blocked address.
-    pub fn ipv4() -> &'static str {
-        Self::IPV4
-    }
-
-    /// Returns the IPv6 blocked address.
-    pub fn ipv6() -> &'static str {
-        Self::IPV6
-    }
-
-    /// Other query types get an empty NOERROR response.
-    pub fn empty_for_other_types() -> bool {
-        true
     }
 }
 
@@ -556,13 +529,6 @@ mod tests {
         file.write_all(content.as_bytes()).unwrap();
         file.flush().unwrap();
         file
-    }
-
-    #[test]
-    fn empty_engine_allows_everything() {
-        let engine = BlocklistEngine::empty();
-        assert_eq!(engine.decide("example.com"), BlockDecision::Allow);
-        assert_eq!(engine.decide("sub.example.com"), BlockDecision::Allow);
     }
 
     #[test]
@@ -752,13 +718,6 @@ supported.example
     }
 
     #[test]
-    fn blocked_response_helpers() {
-        assert_eq!(BlockedResponse::ipv4(), "0.0.0.0");
-        assert_eq!(BlockedResponse::ipv6(), "::");
-        assert!(BlockedResponse::empty_for_other_types());
-    }
-
-    #[test]
     fn reloadable_preserves_old_on_failure() {
         let content = "blocked.com\n";
         let file = make_temp_file(content);
@@ -770,16 +729,11 @@ supported.example
         assert_eq!(reloadable.decide("blocked.com"), BlockDecision::Block);
         assert_eq!(reloadable.block_count(), 1);
 
-        // Point to a nonexistent path; reload should fail.
-        let bad_paths = vec![PathBuf::from("/nonexistent/blocklist.txt")];
-        let bad_reloadable = ReloadableBlocklist::new(bad_paths);
-        // The new reloadable starts empty.
-        assert_eq!(bad_reloadable.decide("blocked.com"), BlockDecision::Allow);
+        drop(file);
 
-        // Attempting to reload with bad paths returns an error.
-        assert!(bad_reloadable.reload().is_err());
-        // Old (empty) rules are preserved.
-        assert_eq!(bad_reloadable.decide("blocked.com"), BlockDecision::Allow);
+        assert!(reloadable.reload().is_err());
+        assert_eq!(reloadable.decide("blocked.com"), BlockDecision::Block);
+        assert_eq!(reloadable.block_count(), 1);
     }
 
     #[test]

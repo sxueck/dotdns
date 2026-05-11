@@ -174,13 +174,15 @@ async fn run_serve(cfg: Config) {
             }
         });
     }
-    let pool = match upstream::pool_from_config(&cfg.upstreams, Some(metrics.clone())) {
-        Ok(p) => p,
-        Err(e) => {
-            eprintln!("failed to build upstream pool: {}", e);
-            std::process::exit(1);
-        }
-    };
+    let pool =
+        match upstream::pool_from_config(&cfg.upstreams, &cfg.bootstrap.dns, Some(metrics.clone()))
+        {
+            Ok(p) => p,
+            Err(e) => {
+                eprintln!("failed to build upstream pool: {}", e);
+                std::process::exit(1);
+            }
+        };
     let server = Server::new(
         cfg.clone(),
         metrics.clone(),

@@ -22,7 +22,7 @@ struct CacheKey {
 impl CacheKey {
     fn from_message(msg: &Message) -> Option<Self> {
         let q = msg.queries().first()?;
-        let do_bit = msg.extensions().as_ref().map_or(false, |e| e.dnssec_ok());
+        let do_bit = msg.extensions().as_ref().is_some_and(|e| e.dnssec_ok());
         let ecs = msg
             .extensions()
             .as_ref()
@@ -167,13 +167,10 @@ impl Cache {
         inner.update_metric();
     }
 
+    #[cfg(test)]
     pub fn len(&self) -> usize {
         let inner = self.inner.lock().unwrap();
         inner.entries.len()
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.len() == 0
     }
 }
 
@@ -238,7 +235,7 @@ mod tests {
         assert_eq!(cached.answers().len(), 1);
         let ttl = cached.answers()[0].ttl();
         assert!(
-            ttl <= 300 && ttl >= 299,
+            (299..=300).contains(&ttl),
             "expected ttl around 300, got {}",
             ttl
         );
@@ -268,16 +265,12 @@ mod tests {
             capacity: 100,
             min_ttl: None,
             max_ttl: None,
-            serve_stale: false,
         };
         let cache = Cache::new(config, metrics);
         let query = test_query("example.com.", RecordType::A);
-        let response = test_response(&query, 1); // 1 second TTL
+        let response = test_response(&query, 0);
 
         cache.insert(&query, &response);
-        assert!(cache.get(&query).is_some());
-
-        std::thread::sleep(std::time::Duration::from_secs(2));
         assert!(cache.get(&query).is_none());
         assert_eq!(cache.len(), 0);
     }
@@ -302,7 +295,6 @@ mod tests {
             capacity: 2,
             min_ttl: None,
             max_ttl: None,
-            serve_stale: false,
         };
         let cache = Cache::new(config, metrics);
         let q1 = test_query("a.com.", RecordType::A);
@@ -325,7 +317,6 @@ mod tests {
             capacity: 100,
             min_ttl: Some(Duration::from_secs(10)),
             max_ttl: Some(Duration::from_secs(20)),
-            serve_stale: false,
         };
         let cache = Cache::new(config, metrics);
         let query = test_query("example.com.", RecordType::A);
@@ -336,7 +327,7 @@ mod tests {
         // Since we just inserted, remaining TTL should be clamped max = 20
         let ttl = cached.answers()[0].ttl();
         assert!(
-            ttl <= 20 && ttl >= 19,
+            (19..=20).contains(&ttl),
             "expected ttl around 20, got {}",
             ttl
         );
@@ -349,7 +340,6 @@ mod tests {
             capacity: 100,
             min_ttl: Some(Duration::from_secs(30)),
             max_ttl: Some(Duration::from_secs(60)),
-            serve_stale: false,
         };
         let cache = Cache::new(config, metrics);
         let query = test_query("minimum.example.", RecordType::A);
@@ -360,7 +350,7 @@ mod tests {
         let cached = cache.get(&query).unwrap();
         let ttl = cached.answers()[0].ttl();
         assert!(
-            ttl <= 30 && ttl >= 29,
+            (29..=30).contains(&ttl),
             "expected ttl around 30, got {}",
             ttl
         );

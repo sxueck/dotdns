@@ -28,11 +28,11 @@ Upstreams are tried in order until one succeeds, so later entries act as fallbac
 
 Cache settings include `capacity`, `min_ttl`, and `max_ttl`. EDNS settings live under `[edns]`; enabling `[edns.client_subnet]` sends an ECS option derived from the client IP to upstream resolvers, using `/24` for IPv4 and `/56` for IPv6 by default while excluding private/local addresses. Client-provided ECS is preserved when `preserve_client = true`.
 
-Blocklists are configured under `[blocklist]` with `enabled`, local `paths`, and optional remote subscription `urls`. Allowlist sources use `allowlist_paths` and `allowlist_urls`; they support the same local and remote loading flow and take precedence over block rules. Remote subscriptions are downloaded to `download_dir` on startup, on `dotdns blocklist reload`, and periodically when `refresh_interval` is set.
+Blocklists are configured under `[blocklist]` with `enabled`, local `paths`, and optional remote subscription `urls`. Allowlist sources use `allowlist_paths` and `allowlist_urls`; they support the same local and remote loading flow and take precedence over block rules. Remote subscriptions are downloaded to `download_dir` on startup, on `dotdns blocklist reload`, and periodically when `refresh_interval` is set. Blocked responses default to `response_mode = "null_ip"` with `blocked_ttl = "5m"`; `no_data` and `nx_domain` modes include SOA negative caching.
 
 DoT upstreams must use a hostname, not a raw IP address, so TLS SNI and certificate validation can work. Per-upstream `tls_cert_path` pinning is not implemented and is rejected during upstream setup.
 
-DoH upstreams use HTTPS POST with `application/dns-message`. DoH hostnames are resolved once when the upstream pool is built and injected into the HTTPS client, so steady-state queries do not need to resolve the DoH hostname through `dotdns` itself. Optional `bootstrap` IPs can override that startup resolution when you need fixed DoH endpoint addresses.
+DoT and DoH upstream hostnames are resolved once when the upstream pool is built. Configure global `[bootstrap].dns` servers to resolve those hostnames through plain DNS at startup; when empty, dotdns uses the system resolver. DoH endpoints are injected into per-endpoint HTTPS clients, so steady-state queries do not need to resolve the DoH hostname through `dotdns` itself and a bad endpoint does not poison the whole DoH upstream.
 
 ## CLI
 
@@ -61,7 +61,7 @@ The parser supports this AdGuard Home-compatible subset:
 
 Unsupported advanced features are skipped, including regex rules, cosmetic/CSS rules, scriptlet rules, and rules with modifiers such as `$third-party` or `$important`.
 
-Blocked `A` queries return `0.0.0.0`; blocked `AAAA` queries return `::`. Exception rules override block rules.
+In the default `null_ip` mode, blocked `A` queries return `0.0.0.0` and blocked `AAAA` queries return `::`, which avoids client DNS retry storms. `no_data` returns `NOERROR` with empty answers and SOA negative caching; `nx_domain` returns `NXDOMAIN` with SOA negative caching. Exception rules override block rules.
 
 ## systemd
 
@@ -81,7 +81,6 @@ Create the `dotdns` system user before enabling the service, and ensure `/etc/do
 
 ## Limitations / TODO
 
-- `serve_stale` config option is accepted but does nothing right now.
 - `tls_cert_path` pinning isn't implemented.
 - Cache eviction is naive (not LRU) — should fix eventually.
 - Unix socket cleanup on shutdown is missing; restart handles stale sockets.
