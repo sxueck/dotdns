@@ -187,7 +187,7 @@ async fn run_serve(cfg: Config) {
     );
 
     info!("dotdns starting");
-    info!("listening on {} (DoT)", cfg.server.bind);
+    info!("listening on {:?} (DoT)", cfg.server.binds);
     info!("upstreams: {}", cfg.upstreams.len());
 
     tokio::select! {

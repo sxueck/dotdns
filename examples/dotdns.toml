@@ -2,8 +2,8 @@
 # Copy to /etc/dotdns/dotdns.toml or pass via `dotdns serve --config <path>`.
 
 [server]
-# Address to bind the DoT listener.
-bind = "0.0.0.0:853"
+# Addresses to bind the DoT listener. Use both entries to serve IPv4 and IPv6.
+binds = ["0.0.0.0:853", "[::]:853"]
 # Idle timeout for TLS connections.
 idle_timeout = "60s"
 

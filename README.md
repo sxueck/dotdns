@@ -5,6 +5,7 @@
 ## Deployment
 
 - Public client-facing service: DoT on port `853`.
+- DoT listen addresses are configured with `server.binds`; include both `"0.0.0.0:853"` and `"[::]:853"` to listen on IPv4 and IPv6.
 - TLS certificate and private key are provided by the operator via `tls.cert_path` and `tls.key_path`.
 - Binding port `853` as a non-root user may require elevated permissions or a platform-specific capability such as `CAP_NET_BIND_SERVICE` on Linux.
 - The management interface is local-only by default. The example systemd deployment uses Unix socket `/run/dotdns/dotdns.sock`.

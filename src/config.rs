@@ -61,6 +61,12 @@ impl Config {
         if self.upstreams.is_empty() {
             return Err(ConfigError::NoUpstreams);
         }
+        if self.server.binds.is_empty() {
+            return Err(ConfigError::InvalidValue {
+                field: "server.binds".into(),
+                message: "at least one listen address is required".into(),
+            });
+        }
         for (i, u) in self.upstreams.iter().enumerate() {
             if u.address.is_empty() {
                 return Err(ConfigError::InvalidValue {
@@ -156,7 +162,7 @@ fn host_from_address(address: &str) -> &str {
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct ServerConfig {
-    pub bind: SocketAddr,
+    pub binds: Vec<SocketAddr>,
     /// idle timeout
     #[serde(default = "default_idle_timeout", with = "humantime_serde")]
     pub idle_timeout: Duration,
@@ -418,7 +424,7 @@ mod tests {
     fn parse_minimal_config() {
         let source = r#"
 [server]
-bind = "0.0.0.0:853"
+binds = ["0.0.0.0:853", "[::]:853"]
 
 [[upstreams]]
 name = "cloudflare"
@@ -426,7 +432,8 @@ address = "1.1.1.1:53"
 protocol = "plain"
 "#;
         let cfg = Config::from_toml(source).unwrap();
-        assert_eq!(cfg.server.bind.port(), 853);
+        assert_eq!(cfg.server.binds.len(), 2);
+        assert_eq!(cfg.server.binds[0].port(), 853);
         assert_eq!(cfg.upstreams.len(), 1);
         assert_eq!(cfg.upstreams[0].protocol, UpstreamProtocol::Plain);
     }
@@ -435,17 +442,32 @@ protocol = "plain"
     fn reject_empty_upstreams() {
         let source = r#"
 [server]
-bind = "0.0.0.0:853"
+binds = ["0.0.0.0:853"]
 "#;
         let err = Config::from_toml(source).unwrap_err();
         assert!(matches!(err, ConfigError::NoUpstreams));
     }
 
     #[test]
+    fn reject_empty_server_binds() {
+        let source = r#"
+[server]
+binds = []
+
+[[upstreams]]
+name = "cloudflare"
+address = "1.1.1.1:53"
+protocol = "plain"
+"#;
+        let err = Config::from_toml(source).unwrap_err();
+        assert!(matches!(err, ConfigError::InvalidValue { field, .. } if field == "server.binds"));
+    }
+
+    #[test]
     fn reject_missing_tls_files_when_enabled() {
         let source = r#"
 [server]
-bind = "0.0.0.0:853"
+binds = ["0.0.0.0:853"]
 
 [tls]
 enabled = true
@@ -462,7 +484,7 @@ address = "1.1.1.1:53"
     fn reject_dot_upstream_with_ip_address() {
         let source = r#"
 [server]
-bind = "0.0.0.0:853"
+binds = ["0.0.0.0:853"]
 
 [[upstreams]]
 name = "cf-dot"
@@ -477,7 +499,7 @@ protocol = "dot"
     fn reject_dot_upstream_with_ipv6_address() {
         let source = r#"
 [server]
-bind = "0.0.0.0:853"
+binds = ["0.0.0.0:853"]
 
 [[upstreams]]
 name = "cf-dot"
@@ -492,7 +514,7 @@ protocol = "dot"
     fn reject_management_bind_non_loopback() {
         let source = r#"
 [server]
-bind = "0.0.0.0:853"
+binds = ["0.0.0.0:853"]
 
 [management]
 type = "tcp"
@@ -510,7 +532,7 @@ address = "1.1.1.1:53"
     fn default_management_is_unix_socket() {
         let source = r#"
 [server]
-bind = "0.0.0.0:853"
+binds = ["0.0.0.0:853"]
 
 [[upstreams]]
 name = "cf"
@@ -529,7 +551,7 @@ address = "1.1.1.1:53"
     fn loopback_management_tcp_is_ok() {
         let source = r#"
 [server]
-bind = "0.0.0.0:853"
+binds = ["0.0.0.0:853"]
 
 [management]
 type = "tcp"
@@ -552,7 +574,7 @@ address = "1.1.1.1:53"
     fn parse_full_config() {
         let source = r#"
 [server]
-bind = "0.0.0.0:853"
+binds = ["0.0.0.0:853"]
 idle_timeout = "2m"
 
 [tls]
@@ -627,7 +649,7 @@ format = "json"
     fn reject_non_http_blocklist_url() {
         let source = r#"
 [server]
-bind = "0.0.0.0:853"
+binds = ["0.0.0.0:853", "[::]:853"]
 
 [blocklist]
 urls = ["file:///tmp/list.txt"]
@@ -644,7 +666,7 @@ address = "1.1.1.1:53"
     fn reject_non_http_allowlist_url() {
         let source = r#"
 [server]
-bind = "0.0.0.0:853"
+binds = ["0.0.0.0:853"]
 
 [blocklist]
 allowlist_urls = ["file:///tmp/allow.txt"]
@@ -661,7 +683,7 @@ address = "1.1.1.1:53"
     fn reject_invalid_ecs_prefix() {
         let source = r#"
 [server]
-bind = "0.0.0.0:853"
+binds = ["0.0.0.0:853"]
 
 [edns.client_subnet]
 enabled = true
@@ -680,7 +702,9 @@ address = "1.1.1.1:53"
     #[test]
     fn example_config_matches_implemented_schema() {
         let cfg = Config::from_toml(include_str!("../examples/dotdns.toml")).unwrap();
-        assert_eq!(cfg.server.bind.port(), 853);
+        assert_eq!(cfg.server.binds.len(), 2);
+        assert_eq!(cfg.server.binds[0].port(), 853);
+        assert_eq!(cfg.server.binds[1].port(), 853);
         assert!(cfg.tls.enabled);
         assert_eq!(cfg.upstreams.len(), 3);
         assert_eq!(cfg.upstreams[0].protocol, UpstreamProtocol::Tls);

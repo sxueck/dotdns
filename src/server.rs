@@ -10,6 +10,7 @@ use hickory_proto::rr::rdata::opt::{ClientSubnet, EdnsCode, EdnsOption};
 use hickory_proto::rr::rdata::{A, AAAA};
 use hickory_proto::rr::{Record, RecordType};
 use hickory_proto::serialize::binary::{BinDecodable, BinEncodable};
+use socket2::{Domain, Protocol, Socket, Type};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::path::Path;
 use std::sync::Arc;
@@ -64,38 +65,44 @@ impl Server {
 
     pub async fn run(self) -> Result<(), ServerError> {
         let acceptor = self.build_acceptor().await?;
-        let listener = TcpListener::bind(self.config.server.bind).await?;
+        let mut listeners = Vec::with_capacity(self.config.server.binds.len());
+        for bind in &self.config.server.binds {
+            let listener = bind_listener(*bind)?;
+            tracing::info!("DoT server listening on {}", bind);
+            listeners.push(listener);
+        }
+
         let idle_timeout = self.config.server.idle_timeout;
+        let mut tasks = tokio::task::JoinSet::new();
 
-        tracing::info!("DoT server listening on {}", self.config.server.bind);
-
-        loop {
-            let (stream, peer) = listener.accept().await?;
+        for listener in listeners {
             let acceptor = acceptor.clone();
             let metrics = self.metrics.clone();
             let cache = self.cache.clone();
             let blocklist = self.blocklist.clone();
             let pool = self.pool.clone();
             let edns = self.config.edns.clone();
-
-            tokio::spawn(async move {
-                if let Err(e) = handle_connection(
-                    stream,
-                    acceptor,
-                    peer,
-                    metrics,
-                    cache,
-                    blocklist,
-                    pool,
-                    edns,
-                    idle_timeout,
-                )
-                .await
-                {
-                    tracing::debug!(peer = %peer, error = %e, "connection closed");
-                }
-            });
+            tasks.spawn(accept_loop(
+                listener,
+                acceptor,
+                metrics,
+                cache,
+                blocklist,
+                pool,
+                edns,
+                idle_timeout,
+            ));
         }
+
+        while let Some(result) = tasks.join_next().await {
+            match result {
+                Ok(Ok(())) => {}
+                Ok(Err(e)) => return Err(e),
+                Err(e) => return Err(ServerError::Tls(format!("listener task failed: {e}"))),
+            }
+        }
+
+        Ok(())
     }
 
     async fn build_acceptor(&self) -> Result<TlsAcceptor, ServerError> {
@@ -125,6 +132,62 @@ impl Server {
 
         Ok(TlsAcceptor::from(Arc::new(config)))
     }
+}
+
+async fn accept_loop(
+    listener: TcpListener,
+    acceptor: TlsAcceptor,
+    metrics: Arc<MetricsRecorder>,
+    cache: Arc<Cache>,
+    blocklist: Arc<ReloadableBlocklist>,
+    pool: UpstreamPool,
+    edns: EdnsConfig,
+    idle_timeout: Duration,
+) -> Result<(), ServerError> {
+    loop {
+        let (stream, peer) = listener.accept().await?;
+        let acceptor = acceptor.clone();
+        let metrics = metrics.clone();
+        let cache = cache.clone();
+        let blocklist = blocklist.clone();
+        let pool = pool.clone();
+        let edns = edns.clone();
+
+        tokio::spawn(async move {
+            if let Err(e) = handle_connection(
+                stream,
+                acceptor,
+                peer,
+                metrics,
+                cache,
+                blocklist,
+                pool,
+                edns,
+                idle_timeout,
+            )
+            .await
+            {
+                tracing::debug!(peer = %peer, error = %e, "connection closed");
+            }
+        });
+    }
+}
+
+fn bind_listener(addr: SocketAddr) -> Result<TcpListener, ServerError> {
+    let socket = if addr.is_ipv4() {
+        Socket::new(Domain::IPV4, Type::STREAM, Some(Protocol::TCP))?
+    } else {
+        let socket = Socket::new(Domain::IPV6, Type::STREAM, Some(Protocol::TCP))?;
+        socket.set_only_v6(true)?;
+        socket
+    };
+    socket.set_reuse_address(true)?;
+    socket.bind(&addr.into())?;
+    socket.listen(1024)?;
+
+    let listener: std::net::TcpListener = socket.into();
+    listener.set_nonblocking(true)?;
+    TcpListener::from_std(listener).map_err(ServerError::Io)
 }
 
 fn load_certs(path: &Path) -> Result<Vec<rustls::pki_types::CertificateDer<'static>>, ServerError> {
