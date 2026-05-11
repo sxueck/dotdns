@@ -32,9 +32,11 @@ Blocklists are configured under `[blocklist]` with `enabled`, local `paths`, and
 
 DoT upstreams must use a hostname, not a raw IP address, so TLS SNI and certificate validation can work. Per-upstream `tls_cert_path` pinning is not implemented and is rejected during upstream setup.
 
+DoH upstreams use HTTPS POST with `application/dns-message`. DoH hostnames are resolved once when the upstream pool is built and injected into the HTTPS client, so steady-state queries do not need to resolve the DoH hostname through `dotdns` itself. Optional `bootstrap` IPs can override that startup resolution when you need fixed DoH endpoint addresses.
+
 ## CLI
 
-Management commands use `/tmp/dotdns.sock` by default. Pass `--config <path>` to read the management socket or loopback TCP setting from a config file.
+Management commands read `/etc/dotdns/dotdns.toml` automatically when it exists; otherwise they use `/tmp/dotdns.sock`. Pass `--config <path>` to read another management socket or loopback TCP setting.
 
 ```sh
 dotdns status

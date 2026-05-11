@@ -8,6 +8,8 @@ use crate::config::{UpstreamEntry, UpstreamProtocol};
 use crate::metrics::MetricsRecorder;
 use hickory_proto::op::Message;
 use hickory_proto::serialize::binary::{BinDecodable, BinEncodable};
+use std::error::Error;
+use std::net::{IpAddr, SocketAddr, ToSocketAddrs};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -53,8 +55,19 @@ impl From<std::io::Error> for UpstreamError {
 
 impl From<reqwest::Error> for UpstreamError {
     fn from(e: reqwest::Error) -> Self {
-        UpstreamError::Network(e.to_string())
+        UpstreamError::Network(format_error_chain(&e))
     }
+}
+
+fn format_error_chain(error: &dyn Error) -> String {
+    let mut message = error.to_string();
+    let mut source = error.source();
+    while let Some(err) = source {
+        message.push_str(": ");
+        message.push_str(&err.to_string());
+        source = err.source();
+    }
+    message
 }
 
 // strip port for SNI
@@ -89,7 +102,7 @@ impl Upstream {
         match entry.protocol {
             UpstreamProtocol::Plain => Ok(Upstream::Plain(PlainUpstream::new(&entry.address))),
             UpstreamProtocol::Tls => Ok(Upstream::Dot(DotUpstream::new(&entry.address))),
-            UpstreamProtocol::Https => Ok(Upstream::Doh(DohUpstream::new(&entry.address))),
+            UpstreamProtocol::Https => Ok(Upstream::Doh(DohUpstream::new(entry)?)),
         }
     }
 
@@ -251,20 +264,35 @@ pub struct DohUpstream {
 }
 
 impl DohUpstream {
-    pub fn new(url: &str) -> Self {
-        Self {
-            url: url.to_string(),
-            timeout: Duration::from_secs(5),
-            client: HttpClient::builder()
-                .timeout(Duration::from_secs(10))
-                .build()
-                .expect("reqwest client build"),
+    pub fn new(entry: &UpstreamEntry) -> Result<Self, UpstreamError> {
+        let url = normalize_doh_url(&entry.address)?;
+        let mut builder = HttpClient::builder()
+            .https_only(true)
+            .timeout(Duration::from_secs(10));
+
+        let url_parts = reqwest::Url::parse(&url)
+            .map_err(|e| UpstreamError::InvalidResponse(format!("invalid DoH URL: {e}")))?;
+        let host = url_parts
+            .host_str()
+            .ok_or_else(|| UpstreamError::InvalidResponse("DoH URL has no host".into()))?;
+        let port = url_parts.port_or_known_default().unwrap_or(443);
+        let resolved_addrs = match doh_bootstrap_addrs(entry)? {
+            Some(addrs) => addrs,
+            None => resolve_doh_host(host, port)?,
+        };
+        for addr in resolved_addrs {
+            builder = builder.resolve(host, addr);
         }
+
+        Ok(Self {
+            url,
+            timeout: Duration::from_secs(5),
+            client: builder.build().expect("reqwest client build"),
+        })
     }
 
     pub async fn query(&self, message: &Message) -> Result<Message, UpstreamError> {
         let msg_bytes = message.to_bytes()?;
-
         let response = self
             .client
             .post(&self.url)
@@ -285,6 +313,83 @@ impl DohUpstream {
         let resp_bytes = response.bytes().await?;
         Message::from_bytes(&resp_bytes).map_err(UpstreamError::from)
     }
+}
+
+fn normalize_doh_url(address: &str) -> Result<String, UpstreamError> {
+    let raw = address.trim();
+    let with_scheme = if raw.starts_with("https://") || raw.starts_with("http://") {
+        raw.to_string()
+    } else {
+        format!("https://{raw}")
+    };
+    let mut url = reqwest::Url::parse(&with_scheme)
+        .map_err(|e| UpstreamError::InvalidResponse(format!("invalid DoH URL: {e}")))?;
+    if url.scheme() != "https" {
+        return Err(UpstreamError::UnsupportedFeature(
+            "DoH upstreams require https URLs".into(),
+        ));
+    }
+    if url.path().is_empty() || url.path() == "/" {
+        url.set_path("/dns-query");
+    }
+    Ok(url.to_string())
+}
+
+fn doh_bootstrap_addrs(entry: &UpstreamEntry) -> Result<Option<Vec<SocketAddr>>, UpstreamError> {
+    let Some(value) = entry
+        .extra
+        .get("bootstrap")
+        .or_else(|| entry.extra.get("bootstrap_addrs"))
+    else {
+        return Ok(None);
+    };
+
+    let addrs = match value {
+        toml::Value::String(addr) => parse_bootstrap_addr(&entry.name, addr).map(|addr| vec![addr]),
+        toml::Value::Array(values) => values
+            .iter()
+            .map(|value| match value {
+                toml::Value::String(addr) => parse_bootstrap_addr(&entry.name, addr),
+                _ => Err(UpstreamError::InvalidResponse(format!(
+                    "upstream {} bootstrap entries must be strings",
+                    entry.name
+                ))),
+            })
+            .collect(),
+        _ => Err(UpstreamError::InvalidResponse(format!(
+            "upstream {} bootstrap must be a string or array",
+            entry.name
+        ))),
+    }?;
+    Ok(Some(addrs))
+}
+
+fn parse_bootstrap_addr(name: &str, addr: &str) -> Result<SocketAddr, UpstreamError> {
+    let with_port = if addr.contains(':') {
+        addr.to_string()
+    } else {
+        format!("{addr}:443")
+    };
+    with_port.parse().map_err(|e| {
+        UpstreamError::InvalidResponse(format!("invalid DoH bootstrap for {name}: {e}"))
+    })
+}
+
+fn resolve_doh_host(host: &str, port: u16) -> Result<Vec<SocketAddr>, UpstreamError> {
+    if let Ok(ip) = host.parse::<IpAddr>() {
+        return Ok(vec![SocketAddr::new(ip, port)]);
+    }
+
+    let addrs: Vec<_> = (host, port)
+        .to_socket_addrs()
+        .map_err(|e| UpstreamError::Network(format!("failed to resolve DoH host {host}: {e}")))?
+        .collect();
+    if addrs.is_empty() {
+        return Err(UpstreamError::Network(format!(
+            "failed to resolve DoH host {host}: no addresses returned"
+        )));
+    }
+    Ok(addrs)
 }
 
 // --- Upstream Pool (fallback) ---
@@ -432,16 +537,94 @@ mod tests {
 
     #[test]
     fn upstream_from_doh_config() {
-        let entry = UpstreamEntry {
+        let mut entry = UpstreamEntry {
             name: "test".into(),
             address: "https://cloudflare-dns.com/dns-query".into(),
             protocol: UpstreamProtocol::Https,
             tls_cert_path: None,
             extra: Default::default(),
         };
+        entry
+            .extra
+            .insert("bootstrap".into(), toml::Value::String("1.1.1.1".into()));
         let upstream = Upstream::from_entry(&entry).unwrap();
         assert!(matches!(upstream, Upstream::Doh(_)));
         assert_eq!(upstream.name(), "https://cloudflare-dns.com/dns-query");
+    }
+
+    #[test]
+    fn doh_url_defaults_to_https_dns_query_path() {
+        assert_eq!(
+            normalize_doh_url("dot.pub").unwrap(),
+            "https://dot.pub/dns-query"
+        );
+        assert_eq!(
+            normalize_doh_url("https://dot.pub").unwrap(),
+            "https://dot.pub/dns-query"
+        );
+    }
+
+    #[test]
+    fn doh_url_rejects_plain_http() {
+        let err = normalize_doh_url("http://dot.pub/dns-query").unwrap_err();
+        assert!(matches!(err, UpstreamError::UnsupportedFeature(_)));
+    }
+
+    #[test]
+    fn doh_bootstrap_accepts_single_ip_without_port() {
+        let mut entry = UpstreamEntry {
+            name: "tencent-doh".into(),
+            address: "https://dot.pub/dns-query".into(),
+            protocol: UpstreamProtocol::Https,
+            tls_cert_path: None,
+            extra: Default::default(),
+        };
+        entry
+            .extra
+            .insert("bootstrap".into(), toml::Value::String("1.12.12.12".into()));
+
+        let addrs = doh_bootstrap_addrs(&entry).unwrap().unwrap();
+        assert_eq!(addrs, vec!["1.12.12.12:443".parse().unwrap()]);
+    }
+
+    #[test]
+    fn doh_bootstrap_accepts_array() {
+        let mut entry = UpstreamEntry {
+            name: "tencent-doh".into(),
+            address: "https://dot.pub/dns-query".into(),
+            protocol: UpstreamProtocol::Https,
+            tls_cert_path: None,
+            extra: Default::default(),
+        };
+        entry.extra.insert(
+            "bootstrap".into(),
+            toml::Value::Array(vec![
+                toml::Value::String("1.12.12.12".into()),
+                toml::Value::String("120.53.53.53:443".into()),
+            ]),
+        );
+
+        let addrs = doh_bootstrap_addrs(&entry).unwrap().unwrap();
+        assert_eq!(addrs.len(), 2);
+        assert_eq!(addrs[0], "1.12.12.12:443".parse().unwrap());
+        assert_eq!(addrs[1], "120.53.53.53:443".parse().unwrap());
+    }
+
+    #[test]
+    fn doh_bootstrap_is_optional() {
+        let entry = UpstreamEntry {
+            name: "local-doh".into(),
+            address: "https://127.0.0.1/dns-query".into(),
+            protocol: UpstreamProtocol::Https,
+            tls_cert_path: None,
+            extra: Default::default(),
+        };
+
+        assert!(doh_bootstrap_addrs(&entry).unwrap().is_none());
+        assert_eq!(
+            resolve_doh_host("127.0.0.1", 443).unwrap(),
+            vec!["127.0.0.1:443".parse().unwrap()]
+        );
     }
 
     #[test]

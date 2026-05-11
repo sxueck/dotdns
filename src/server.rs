@@ -106,32 +106,44 @@ impl Server {
     }
 
     async fn build_acceptor(&self) -> Result<TlsAcceptor, ServerError> {
-        if !self.config.tls.enabled {
-            return Err(ServerError::Tls("TLS is not enabled in config".into()));
-        }
-        let cert_path = self
-            .config
-            .tls
-            .cert_path
-            .as_ref()
-            .ok_or_else(|| ServerError::Tls("missing cert_path".into()))?;
-        let key_path = self
-            .config
-            .tls
-            .key_path
-            .as_ref()
-            .ok_or_else(|| ServerError::Tls("missing key_path".into()))?;
-
-        let certs = load_certs(cert_path)?;
-        let key = load_key(key_path)?;
-
-        let config = rustls::ServerConfig::builder()
-            .with_no_client_auth()
-            .with_single_cert(certs, key)
-            .map_err(|e| ServerError::Tls(e.to_string()))?;
+        let config = build_tls_server_config(&self.config)?;
 
         Ok(TlsAcceptor::from(Arc::new(config)))
     }
+}
+
+pub fn validate_tls_config(config: &Config) -> Result<(), ServerError> {
+    build_tls_server_config(config).map(|_| ())
+}
+
+fn build_tls_server_config(config: &Config) -> Result<rustls::ServerConfig, ServerError> {
+    if !config.tls.enabled {
+        return Err(ServerError::Tls("TLS is not enabled in config".into()));
+    }
+    let cert_path = config
+        .tls
+        .cert_path
+        .as_ref()
+        .ok_or_else(|| ServerError::Tls("missing cert_path".into()))?;
+    let key_path = config
+        .tls
+        .key_path
+        .as_ref()
+        .ok_or_else(|| ServerError::Tls("missing key_path".into()))?;
+
+    let certs = load_certs(cert_path)?;
+    if certs.is_empty() {
+        return Err(ServerError::Tls(format!(
+            "no certificates found in {}",
+            cert_path.display()
+        )));
+    }
+    let key = load_key(key_path)?;
+
+    rustls::ServerConfig::builder()
+        .with_no_client_auth()
+        .with_single_cert(certs, key)
+        .map_err(|e| ServerError::Tls(e.to_string()))
 }
 
 async fn accept_loop(

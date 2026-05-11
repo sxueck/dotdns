@@ -92,6 +92,16 @@ impl ManagementServer {
     }
 
     async fn run_unix(&self, path: &Path) -> Result<(), ManagementError> {
+        if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
+            tokio::fs::create_dir_all(parent).await.map_err(|e| {
+                ManagementError::Connection(format!(
+                    "failed to create socket directory {}: {}",
+                    parent.display(),
+                    e
+                ))
+            })?;
+        }
+
         if path.exists() {
             std::fs::remove_file(path).map_err(|e| {
                 ManagementError::Connection(format!(
@@ -466,6 +476,35 @@ mod tests {
         let snap = client.status().await.expect("status should succeed");
         assert_eq!(snap.total_queries, 1);
         assert_eq!(snap.cache_hits, 1);
+    }
+
+    #[tokio::test]
+    async fn unix_socket_parent_directory_is_created() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("run/dotdns/mgmt.sock");
+        let transport = ManagementTransport::Unix { path: path.clone() };
+
+        let metrics = Arc::new(MetricsRecorder::new());
+        let cache = Arc::new(Cache::new(CacheConfig::default(), metrics.clone()));
+        let blocklist = Arc::new(ReloadableBlocklist::new(vec![]));
+        let server = ManagementServer::new(
+            ManagementConfig {
+                transport: transport.clone(),
+            },
+            metrics,
+            cache,
+            blocklist,
+        );
+
+        let _srv_handle = tokio::spawn(async move {
+            let _ = server.run().await;
+        });
+
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert!(path.exists());
+
+        let client = ManagementClient::new(transport);
+        client.status().await.expect("status should succeed");
     }
 
     #[tokio::test]

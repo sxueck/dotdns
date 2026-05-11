@@ -23,6 +23,8 @@ protocol = "dot"
 name = "cloudflare-doh"
 address = "https://cloudflare-dns.com/dns-query"
 protocol = "doh"
+# Optional override; by default dotdns resolves the DoH hostname once at startup.
+# bootstrap = ["1.1.1.1:443", "1.0.0.1:443"]
 
 [[upstreams]]
 name = "google-plain"

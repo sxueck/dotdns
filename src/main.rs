@@ -119,7 +119,7 @@ fn init_logging(cfg: &Config) {
 }
 
 fn load_mgmt_transport(config: Option<PathBuf>) -> ManagementTransport {
-    match config {
+    match config.or_else(default_config_path) {
         Some(path) => {
             let source = fs::read_to_string(&path).unwrap_or_else(|e| {
                 eprintln!("failed to read config {}: {}", path.display(), e);
@@ -135,9 +135,18 @@ fn load_mgmt_transport(config: Option<PathBuf>) -> ManagementTransport {
     }
 }
 
+fn default_config_path() -> Option<PathBuf> {
+    let path = PathBuf::from("/etc/dotdns/dotdns.toml");
+    path.exists().then_some(path)
+}
+
 async fn run_serve(cfg: Config) {
     // TODO: graceful shutdown could be cleaner
     let cfg = Arc::new(cfg);
+    if let Err(e) = server::validate_tls_config(&cfg) {
+        eprintln!("TLS certificate validation failed: {}", e);
+        std::process::exit(1);
+    }
     let metrics = Arc::new(MetricsRecorder::new());
     let cache = Arc::new(Cache::new(cfg.cache.clone(), metrics.clone()));
     let blocklist = Arc::new(ReloadableBlocklist::from_config(&cfg.blocklist));
