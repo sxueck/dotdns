@@ -77,7 +77,32 @@ systemctl daemon-reload
 systemctl enable --now dotdns.service
 ```
 
-Create the `dotdns` system user before enabling the service, and ensure `/etc/dotdns/dotdns.toml` points at valid TLS certificate and key files. `systemctl reload dotdns.service` maps to `dotdns blocklist reload`, which fetches remote subscriptions and swaps in the parsed rules without restarting the resolver.
+### User and permissions
+
+The service runs as an unprivileged `dotdns` user. You must create this user before starting the service. The preferred method on modern distributions is `systemd-sysusers`:
+
+```sh
+install -Dm644 packaging/systemd/dotdns-sysusers.conf /usr/lib/sysusers.d/dotdns.conf
+systemd-sysusers
+```
+
+If `systemd-sysusers` is unavailable, create the user manually:
+
+```sh
+useradd --system --no-create-home --home-dir /var/lib/dotdns dotdns
+```
+
+Ensure `/etc/dotdns/dotdns.toml` points at valid TLS certificate and key files that are readable by the `dotdns` user.
+
+### Binding to port 853 as a non-root user
+
+The service file uses `AmbientCapabilities=CAP_NET_BIND_SERVICE` (requires **systemd >= 228**) so the unprivileged `dotdns` user can listen on the privileged DoT port 853. If you are running an older systemd version where this directive is ignored, grant the capability directly to the binary instead:
+
+```sh
+setcap cap_net_bind_service=+ep /usr/local/bin/dotdns
+```
+
+`systemctl reload dotdns.service` maps to `dotdns blocklist reload`, which fetches remote subscriptions and swaps in the parsed rules without restarting the resolver.
 
 ## Limitations / TODO
 

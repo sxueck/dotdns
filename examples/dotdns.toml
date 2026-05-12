@@ -82,6 +82,10 @@ path = "/run/dotdns/dotdns.sock"
 # type = "tcp"
 # bind = "127.0.0.1:9953"
 
+# Path to the persistent stats file. Cumulative counters are saved here
+# every 60 seconds and on graceful shutdown so they survive restarts.
+# stats_path = "/var/lib/dotdns/stats.json"
+
 [logging]
 level = "info"
 format = "pretty"

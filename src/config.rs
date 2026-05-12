@@ -43,6 +43,8 @@ pub struct Config {
     pub management: ManagementConfig,
     #[serde(default)]
     pub logging: LoggingConfig,
+    #[serde(default = "default_stats_path")]
+    pub stats_path: PathBuf,
 }
 
 impl Config {
@@ -368,6 +370,10 @@ fn default_blocked_ttl() -> Duration {
 
 fn default_true() -> bool {
     true
+}
+
+fn default_stats_path() -> PathBuf {
+    PathBuf::from("/var/lib/dotdns/stats.json")
 }
 
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]

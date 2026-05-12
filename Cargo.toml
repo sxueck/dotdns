@@ -20,6 +20,7 @@ tokio-rustls = "0.26"
 webpki-roots = "0.26"
 rustls-pemfile = "2"
 socket2 = "0.6"
+x509-parser = "0.16"
 
 [dev-dependencies]
 tempfile = "3"

@@ -12,12 +12,13 @@ use crate::cache::Cache;
 use crate::cli::{BlocklistCommands, CacheCommands, Cli, Commands};
 use crate::config::{Config, ManagementTransport};
 use crate::management::{ManagementClient, ManagementServer};
-use crate::metrics::MetricsRecorder;
+use crate::metrics::{load_stats, save_stats, MetricsRecorder};
 use crate::server::Server;
 use clap::Parser;
 use std::fs;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::Duration;
 use tracing::info;
 
 #[tokio::main]
@@ -141,13 +142,20 @@ fn default_config_path() -> Option<PathBuf> {
 }
 
 async fn run_serve(cfg: Config) {
-    // TODO: graceful shutdown could be cleaner
     let cfg = Arc::new(cfg);
     if let Err(e) = server::validate_tls_config(&cfg) {
         eprintln!("TLS certificate validation failed: {}", e);
         std::process::exit(1);
     }
-    let metrics = Arc::new(MetricsRecorder::new());
+
+    let metrics = match load_stats(&cfg.stats_path) {
+        Some(persisted) => {
+            tracing::info!("restored metrics from {}", cfg.stats_path.display());
+            Arc::new(MetricsRecorder::from_persisted(&persisted))
+        }
+        None => Arc::new(MetricsRecorder::new()),
+    };
+
     let cache = Arc::new(Cache::new(cfg.cache.clone(), metrics.clone()));
     let blocklist = Arc::new(ReloadableBlocklist::from_config(&cfg.blocklist));
     if cfg.blocklist.enabled {
@@ -197,6 +205,22 @@ async fn run_serve(cfg: Config) {
         blocklist.clone(),
     );
 
+    let metrics_for_save = metrics.clone();
+    let stats_path = cfg.stats_path.clone();
+    tokio::spawn(async move {
+        let mut ticker = tokio::time::interval(Duration::from_secs(60));
+        loop {
+            ticker.tick().await;
+            let m = metrics_for_save.to_persisted();
+            let p = stats_path.clone();
+            match tokio::task::spawn_blocking(move || save_stats(&p, &m)).await {
+                Ok(Ok(())) => {}
+                Ok(Err(e)) => tracing::warn!(error = %e, "periodic stats save failed"),
+                Err(e) => tracing::warn!(error = %e, "stats save task panicked"),
+            }
+        }
+    });
+
     info!("dotdns starting");
     info!("listening on {:?} (DoT)", cfg.server.binds);
     info!("upstreams: {}", cfg.upstreams.len());
@@ -214,8 +238,27 @@ async fn run_serve(cfg: Config) {
                 std::process::exit(1);
             }
         }
-        _ = tokio::signal::ctrl_c() => {
+        _ = wait_for_shutdown() => {
             info!("shutting down");
         }
     }
+
+    if let Err(e) = save_stats(&cfg.stats_path, &metrics.to_persisted()) {
+        tracing::warn!(error = %e, "final stats save failed");
+    }
+}
+
+#[cfg(unix)]
+async fn wait_for_shutdown() {
+    let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+        .expect("SIGTERM handler");
+    tokio::select! {
+        _ = tokio::signal::ctrl_c() => {},
+        _ = sigterm.recv() => {},
+    }
+}
+
+#[cfg(not(unix))]
+async fn wait_for_shutdown() {
+    tokio::signal::ctrl_c().await.ok();
 }

@@ -197,10 +197,39 @@ fn build_tls_server_config(config: &Config) -> Result<rustls::ServerConfig, Serv
     }
     let key = load_key(key_path)?;
 
-    rustls::ServerConfig::builder()
+    let config = rustls::ServerConfig::builder()
         .with_no_client_auth()
-        .with_single_cert(certs, key)
-        .map_err(|e| ServerError::Tls(e.to_string()))
+        .with_single_cert(certs.clone(), key)
+        .map_err(|e| ServerError::Tls(e.to_string()))?;
+
+    log_certificate_info(&certs);
+
+    Ok(config)
+}
+
+fn log_certificate_info(certs: &[rustls::pki_types::CertificateDer<'static>]) {
+    let cert = match certs.first() {
+        Some(c) => c,
+        None => return,
+    };
+    match x509_parser::parse_x509_certificate(cert.as_ref()) {
+        Ok((_, cert)) => {
+            let subject = cert.subject.to_string();
+            let issuer = cert.issuer.to_string();
+            let not_before = cert.validity.not_before.to_string();
+            let not_after = cert.validity.not_after.to_string();
+            tracing::info!(
+                subject = %subject,
+                issuer = %issuer,
+                not_before = %not_before,
+                not_after = %not_after,
+                "TLS certificate verified successfully"
+            );
+        }
+        Err(e) => {
+            tracing::warn!(error = %e, "failed to parse TLS certificate for logging");
+        }
+    }
 }
 
 #[derive(Clone)]
