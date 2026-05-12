@@ -41,9 +41,19 @@ impl From<UpstreamError> for ServerError {
 
 type PendingResult = Result<Message, UpstreamError>;
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub(crate) struct PendingQueries {
     inner: Arc<Mutex<HashMap<Vec<u8>, PendingEntry>>>,
+    metrics: Arc<MetricsRecorder>,
+}
+
+impl PendingQueries {
+    pub fn new(metrics: Arc<MetricsRecorder>) -> Self {
+        Self {
+            inner: Arc::new(Mutex::new(HashMap::new())),
+            metrics,
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -57,6 +67,8 @@ fn pending_key(query: &Message) -> Result<Vec<u8>, UpstreamError> {
     clone.set_id(0);
     clone.to_bytes().map_err(UpstreamError::from)
 }
+
+const PENDING_FOLLOWER_TIMEOUT: Duration = Duration::from_secs(10);
 
 impl PendingQueries {
     async fn query(&self, pool: &UpstreamPool, query: &Message) -> PendingResult {
@@ -73,19 +85,40 @@ impl PendingQueries {
         };
 
         if !leader {
-            loop {
-                if let Some(result) = rx.borrow().clone() {
-                    return result;
+            self.metrics.record_pending_follower_joined();
+            let result = tokio::time::timeout(PENDING_FOLLOWER_TIMEOUT, async {
+                loop {
+                    if let Some(result) = rx.borrow().clone() {
+                        return Some(result);
+                    }
+                    if rx.changed().await.is_err() {
+                        return None;
+                    }
                 }
-                if rx.changed().await.is_err() {
-                    return Err(UpstreamError::Network(
+            })
+            .await;
+
+            return match result {
+                Ok(Some(r)) => {
+                    self.metrics.record_pending_follower_resolved();
+                    r
+                }
+                Ok(None) => {
+                    self.metrics.record_pending_follower_timeout();
+                    Err(UpstreamError::Network(
                         "pending upstream request was cancelled".into(),
-                    ));
+                    ))
                 }
-            }
+                Err(_) => {
+                    self.metrics.record_pending_follower_timeout();
+                    Err(UpstreamError::Timeout)
+                }
+            };
         }
 
+        self.metrics.record_pending_leader_started();
         let result = pool.query(query).await;
+        self.metrics.record_pending_leader_completed();
         let tx = {
             let mut inner = self.inner.lock().await;
             inner.remove(&key).map(|entry| entry.tx)
@@ -115,13 +148,14 @@ impl Server {
         blocklist: Arc<ReloadableBlocklist>,
         pool: UpstreamPool,
     ) -> Self {
+        let pending = PendingQueries::new(metrics.clone());
         Self {
             config,
             metrics,
             cache,
             blocklist,
             pool,
-            pending: PendingQueries::default(),
+            pending,
         }
     }
 
@@ -249,11 +283,14 @@ async fn accept_loop(listener: TcpListener, ctx: ConnectionContext) -> Result<()
     loop {
         let (stream, peer) = listener.accept().await?;
         let conn_ctx = ctx.clone();
+        ctx.metrics.record_accepted_connection();
 
+        let metrics = conn_ctx.metrics.clone();
         tokio::spawn(async move {
             if let Err(e) = handle_connection(stream, peer, conn_ctx).await {
                 tracing::debug!(peer = %peer, error = %e, "connection closed");
             }
+            metrics.record_active_connection_closed();
         });
     }
 }
@@ -296,11 +333,16 @@ async fn handle_connection(
     peer: SocketAddr,
     ctx: ConnectionContext,
 ) -> Result<(), ServerError> {
-    let mut tls_stream = ctx
-        .acceptor
-        .accept(stream)
-        .await
-        .map_err(|e| ServerError::Tls(e.to_string()))?;
+    let mut tls_stream = match ctx.acceptor.accept(stream).await {
+        Ok(s) => {
+            ctx.metrics.record_tls_handshake_success();
+            s
+        }
+        Err(e) => {
+            ctx.metrics.record_tls_handshake_failure();
+            return Err(ServerError::Tls(e.to_string()));
+        }
+    };
 
     loop {
         match read_message(&mut tls_stream, ctx.idle_timeout).await {
@@ -317,12 +359,14 @@ async fn handle_connection(
                 };
                 let response = resolve_with_context(query, &resolve_ctx).await;
                 if let Err(e) = write_message(&mut tls_stream, &response, ctx.idle_timeout).await {
+                    ctx.metrics.record_dns_write_failure();
                     tracing::debug!(error = %e, "write error");
                     break;
                 }
             }
             Ok(None) => break,
             Err(e) => {
+                ctx.metrics.record_dns_read_failure();
                 tracing::debug!(error = %e, "read error");
                 break;
             }
@@ -385,7 +429,6 @@ pub(crate) struct ResolveContext<'a> {
     pub(crate) blocklist_config: &'a BlocklistConfig,
 }
 
-/// Main resolve path.
 #[cfg(test)]
 pub async fn resolve(
     query: Message,
@@ -394,6 +437,7 @@ pub async fn resolve(
     blocklist: &ReloadableBlocklist,
     pool: &UpstreamPool,
 ) -> Message {
+    let pending = PendingQueries::new(Arc::new(MetricsRecorder::new()));
     resolve_with_context(
         query,
         &ResolveContext {
@@ -401,7 +445,7 @@ pub async fn resolve(
             cache,
             blocklist,
             pool,
-            pending: &PendingQueries::default(),
+            pending: &pending,
             client_ip: None,
             edns: &EdnsConfig::default(),
             blocklist_config: &BlocklistConfig::default(),
@@ -423,7 +467,6 @@ pub(crate) async fn resolve_with_context(query: Message, ctx: &ResolveContext<'_
     let domain = q.name().to_utf8();
     let domain = domain.trim_end_matches('.');
 
-    // Blocklist check
     if ctx.blocklist.decide(domain).is_blocked() {
         ctx.metrics.record_blocked();
         return make_blocked_response(&query, ctx.blocklist_config);
@@ -431,7 +474,6 @@ pub(crate) async fn resolve_with_context(query: Message, ctx: &ResolveContext<'_
 
     let upstream_query = query_with_ecs(&query, ctx.client_ip, ctx.edns);
 
-    // Cache check
     if let Some(cached) = ctx.cache.get(&upstream_query) {
         ctx.metrics.record_cache_hit();
         let mut resp = cached;
@@ -441,7 +483,6 @@ pub(crate) async fn resolve_with_context(query: Message, ctx: &ResolveContext<'_
 
     ctx.metrics.record_cache_miss();
 
-    // Forward to upstream
     match ctx.pending.query(ctx.pool, &upstream_query).await {
         Ok(mut response) => {
             response.set_id(query.id());
@@ -799,7 +840,7 @@ mod tests {
 
     #[tokio::test]
     async fn resolver_blocklist_before_upstream() {
-        let mut engine = BlocklistEngine::empty();
+        let mut engine = BlocklistEngine::default();
         engine.add_block("blocked.com");
         let blocklist = Arc::new(ReloadableBlocklist::from_engine(engine, vec![]));
         let metrics = Arc::new(MetricsRecorder::new());
@@ -810,6 +851,7 @@ mod tests {
             address: "127.0.0.1:1".into(),
             protocol: UpstreamProtocol::Plain,
             tls_cert_path: None,
+            timeout: Duration::from_secs(5),
         };
         let pool = pool_from_config(&[entry], &[], None).unwrap();
 
@@ -826,7 +868,7 @@ mod tests {
 
     #[tokio::test]
     async fn resolver_blocked_a_returns_ipv4_zero() {
-        let mut engine = BlocklistEngine::empty();
+        let mut engine = BlocklistEngine::default();
         engine.add_block("blocked.com");
         let blocklist = Arc::new(ReloadableBlocklist::from_engine(engine, vec![]));
         let metrics = Arc::new(MetricsRecorder::new());
@@ -843,7 +885,7 @@ mod tests {
 
     #[tokio::test]
     async fn resolver_blocked_aaaa_returns_ipv6_zero() {
-        let mut engine = BlocklistEngine::empty();
+        let mut engine = BlocklistEngine::default();
         engine.add_block("blocked.com");
         let blocklist = Arc::new(ReloadableBlocklist::from_engine(engine, vec![]));
         let metrics = Arc::new(MetricsRecorder::new());
@@ -862,7 +904,7 @@ mod tests {
 
     #[tokio::test]
     async fn resolver_blocked_other_type_empty_success() {
-        let mut engine = BlocklistEngine::empty();
+        let mut engine = BlocklistEngine::default();
         engine.add_block("blocked.com");
         let blocklist = Arc::new(ReloadableBlocklist::from_engine(engine, vec![]));
         let metrics = Arc::new(MetricsRecorder::new());
@@ -924,9 +966,11 @@ mod tests {
             address: addr.to_string(),
             protocol: UpstreamProtocol::Plain,
             tls_cert_path: None,
+            timeout: Duration::from_secs(5),
         };
         let pool = pool_from_config(&[entry], &[], None).unwrap();
-        let pending = PendingQueries::default();
+        let metrics = Arc::new(MetricsRecorder::new());
+        let pending = PendingQueries::new(metrics);
         let mut query1 = test_query("example.com.", RecordType::A);
         query1.set_id(1000);
         let mut query2 = test_query("example.com.", RecordType::A);
@@ -941,6 +985,40 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn pending_query_cancellation_balances_follower_metrics() {
+        let metrics = Arc::new(MetricsRecorder::new());
+        let pending = PendingQueries::new(metrics.clone());
+        let query = test_query("example.com.", RecordType::A);
+        let key = pending_key(&query).unwrap();
+        let (tx, rx) = watch::channel(None);
+        pending
+            .inner
+            .lock()
+            .await
+            .insert(key.clone(), PendingEntry { tx, rx });
+
+        let entry = UpstreamEntry {
+            name: "mock".into(),
+            address: "127.0.0.1:9".into(),
+            protocol: UpstreamProtocol::Plain,
+            tls_cert_path: None,
+            timeout: Duration::from_secs(5),
+        };
+        let pool = pool_from_config(&[entry], &[], None).unwrap();
+        let pending_for_task = pending.clone();
+        let task = tokio::spawn(async move { pending_for_task.query(&pool, &query).await });
+
+        tokio::task::yield_now().await;
+        pending.inner.lock().await.remove(&key);
+
+        let result = task.await.unwrap();
+        assert!(matches!(result, Err(UpstreamError::Network(_))));
+        let snapshot = metrics.snapshot();
+        assert_eq!(snapshot.pending_followers, 0);
+        assert_eq!(snapshot.pending_follower_timeouts, 1);
+    }
+
+    #[tokio::test]
     async fn resolver_coalesces_different_ids_and_preserves_them() {
         let count = Arc::new(AtomicUsize::new(0));
         let (_handle, addr) = start_counting_udp_server("127.0.0.1:0", count.clone()).await;
@@ -950,12 +1028,13 @@ mod tests {
             address: addr.to_string(),
             protocol: UpstreamProtocol::Plain,
             tls_cert_path: None,
+            timeout: Duration::from_secs(5),
         };
         let metrics = Arc::new(MetricsRecorder::new());
         let cache = Arc::new(Cache::new(CacheConfig::default(), metrics.clone()));
         let blocklist = Arc::new(ReloadableBlocklist::new(vec![]));
         let pool = pool_from_config(&[entry], &[], None).unwrap();
-        let pending = PendingQueries::default();
+        let pending = PendingQueries::new(metrics.clone());
         let edns = EdnsConfig::default();
         let blocklist_config = BlocklistConfig::default();
 
@@ -993,6 +1072,7 @@ mod tests {
             address: addr.to_string(),
             protocol: UpstreamProtocol::Plain,
             tls_cert_path: None,
+            timeout: Duration::from_secs(5),
         };
         let metrics = Arc::new(MetricsRecorder::new());
         let cache = Arc::new(Cache::new(CacheConfig::default(), metrics.clone()));
@@ -1021,6 +1101,7 @@ mod tests {
             address: addr.to_string(),
             protocol: UpstreamProtocol::Plain,
             tls_cert_path: None,
+            timeout: Duration::from_secs(5),
         };
         let metrics = Arc::new(MetricsRecorder::new());
         let cache = Arc::new(Cache::new(CacheConfig::default(), metrics.clone()));

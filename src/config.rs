@@ -75,6 +75,12 @@ impl Config {
                     message: "upstream address must not be empty".into(),
                 });
             }
+            if u.timeout.is_zero() {
+                return Err(ConfigError::InvalidValue {
+                    field: format!("upstreams[{}].timeout", i),
+                    message: "upstream timeout must be greater than zero".into(),
+                });
+            }
             if u.protocol == UpstreamProtocol::Tls {
                 let host = host_from_address(&u.address);
                 if host.parse::<IpAddr>().is_ok() {
@@ -161,7 +167,6 @@ fn is_loopback(addr: &SocketAddr) -> bool {
     addr.ip().is_loopback()
 }
 
-// strip port from address
 fn host_from_address(address: &str) -> &str {
     if let Some(rest) = address.strip_prefix('[') {
         if let Some((host, _)) = rest.split_once(']') {
@@ -176,7 +181,6 @@ fn host_from_address(address: &str) -> &str {
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct ServerConfig {
     pub binds: Vec<SocketAddr>,
-    /// idle timeout
     #[serde(default = "default_idle_timeout", with = "humantime_serde")]
     pub idle_timeout: Duration,
 }
@@ -212,6 +216,10 @@ impl fmt::Display for UpstreamProtocol {
     }
 }
 
+fn default_upstream_timeout() -> Duration {
+    Duration::from_secs(5)
+}
+
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct UpstreamEntry {
@@ -220,6 +228,8 @@ pub struct UpstreamEntry {
     #[serde(default)]
     pub protocol: UpstreamProtocol,
     pub tls_cert_path: Option<PathBuf>,
+    #[serde(default = "default_upstream_timeout", with = "humantime_serde")]
+    pub timeout: Duration,
 }
 
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
@@ -521,6 +531,23 @@ protocol = "dot"
 "#;
         let err = Config::from_toml(source).unwrap_err();
         assert!(matches!(err, ConfigError::InvalidValue { .. }));
+    }
+
+    #[test]
+    fn reject_zero_upstream_timeout() {
+        let source = r#"
+[server]
+binds = ["0.0.0.0:853"]
+
+[[upstreams]]
+name = "cf"
+address = "1.1.1.1:53"
+timeout = "0s"
+"#;
+        let err = Config::from_toml(source).unwrap_err();
+        assert!(
+            matches!(err, ConfigError::InvalidValue { field, .. } if field == "upstreams[0].timeout")
+        );
     }
 
     #[test]

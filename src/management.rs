@@ -10,10 +10,6 @@ use std::sync::Arc;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{TcpListener, TcpStream, UnixListener, UnixStream};
 
-// ---------------------------------------------------------------------------
-// Wire protocol
-// ---------------------------------------------------------------------------
-
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "cmd", rename_all = "snake_case")]
 pub enum ManagementRequest {
@@ -56,10 +52,6 @@ impl ManagementResponse {
         }
     }
 }
-
-// ---------------------------------------------------------------------------
-// Server
-// ---------------------------------------------------------------------------
 
 #[derive(Debug)]
 pub struct ManagementServer {
@@ -249,10 +241,6 @@ async fn dispatch(
     }
 }
 
-// ---------------------------------------------------------------------------
-// Client
-// ---------------------------------------------------------------------------
-
 #[derive(Debug, Clone)]
 pub struct ManagementClient {
     transport: ManagementTransport,
@@ -358,10 +346,6 @@ impl ManagementClient {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Errors
-// ---------------------------------------------------------------------------
-
 #[derive(Debug, thiserror::Error)]
 pub enum ManagementError {
     #[error("connection failed: {0}")]
@@ -369,10 +353,6 @@ pub enum ManagementError {
     #[error("request failed: {0}")]
     Request(String),
 }
-
-// ---------------------------------------------------------------------------
-// Tests
-// ---------------------------------------------------------------------------
 
 #[cfg(test)]
 mod tests {

@@ -32,6 +32,8 @@ Blocklists are configured under `[blocklist]` with `enabled`, local `paths`, and
 
 DoT upstreams must use a hostname, not a raw IP address, so TLS SNI and certificate validation can work. Per-upstream `tls_cert_path` pinning is not implemented and is rejected during upstream setup.
 
+Each upstream can set its own `timeout` (default `5s`). This controls how long dotdns waits for a single query on that upstream before falling back to the next one.
+
 DoT and DoH upstream hostnames are resolved once when the upstream pool is built. Configure global `[bootstrap].dns` servers to resolve those hostnames through plain DNS at startup; when empty, dotdns uses the system resolver. DoH endpoints are injected into per-endpoint HTTPS clients, so steady-state queries do not need to resolve the DoH hostname through `dotdns` itself and a bad endpoint does not poison the whole DoH upstream.
 
 ## CLI
@@ -47,7 +49,7 @@ dotdns cache flush --config /etc/dotdns/dotdns.toml
 dotdns blocklist reload --config /etc/dotdns/dotdns.toml
 ```
 
-`dotdns status` reports uptime, total queries, cache hits, cache misses, blocked queries, upstream failures, and cache entries. `dotdns cache stats` prints cache entries and hit/miss counters.
+`dotdns status` reports uptime, total queries, cache hits/misses/evictions, blocked queries, upstream successes/failures/timeouts, accepted/active connections, TLS handshake successes/failures, DNS read/write failures, and pending leader/follower counts. `dotdns cache stats` prints cache entries and hit/miss counters.
 
 ## Blocklist Subset
 
@@ -103,6 +105,25 @@ setcap cap_net_bind_service=+ep /usr/local/bin/dotdns
 ```
 
 `systemctl reload dotdns.service` maps to `dotdns blocklist reload`, which fetches remote subscriptions and swaps in the parsed rules without restarting the resolver.
+
+## Troubleshooting
+
+### Android Private DNS shows "Private DNS server cannot be accessed" after enabling VPN
+
+1. Verify `server.binds` includes both `"0.0.0.0:853"` and `"[::]:853"` so the service accepts IPv4 and IPv6 traffic.
+2. Make sure Android Private DNS is configured with the **hostname** used in the TLS certificate SAN, not a raw IP address.
+3. Confirm the certificate is valid, not expired, and trusted by the Android device.
+4. Check whether the VPN blocks or redirects port `853`. If dotdns `status` shows `accepted_connections` is not increasing during the failure, the traffic is not reaching dotdns.
+5. Look for `tls_handshake_failures` in `dotdns status`. If these increase, the TLS handshake is failing (certificate, SNI, or protocol mismatch).
+6. Check `dns_read_failures` and `upstream_failures`/`upstream_timeouts`. If queries reach dotdns but upstream resolution fails, the issue is likely upstream reachability or timeout.
+
+### Images or CDN resources fail to load
+
+1. Run `dotdns status` and check the ratio of `cache_hits` to `cache_misses`. A very low hit ratio with high `cache_evictions` means the cache is under pressure.
+2. If you use `[edns.client_subnet]`, different client subnets fragment the cache. Try disabling ECS temporarily to see if hit ratio improves.
+3. Check `upstream_timeouts` and `upstream_failures`. If they are high, increase the per-upstream `timeout` or switch slow DoT upstreams to DoH, which reuses HTTP/2 connections.
+4. Check `pending_followers` and `pending_follower_timeouts`. If many followers time out, the upstream is slower than the 10s pending coalescing safety timeout.
+5. If `accepted_connections` grows much faster than `total_queries`, clients may be opening many short connections. This is expected for DoT but can stress the server if sustained.
 
 ## Limitations / TODO
 

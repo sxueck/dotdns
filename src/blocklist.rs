@@ -52,14 +52,6 @@ pub struct BlocklistEngine {
 }
 
 impl BlocklistEngine {
-    pub fn empty() -> Self {
-        Self {
-            blocks: HashSet::new(),
-            exceptions: HashSet::new(),
-        }
-    }
-
-    // Returns (engine, report). report tells you how many lines were skipped.
     #[cfg(test)]
     pub fn from_paths(paths: &[PathBuf]) -> Result<(Self, ParseReport), BlocklistError> {
         Self::from_sources(paths, &[])
@@ -69,7 +61,7 @@ impl BlocklistEngine {
         block_paths: &[PathBuf],
         allow_paths: &[PathBuf],
     ) -> Result<(Self, ParseReport), BlocklistError> {
-        let mut engine = Self::empty();
+        let mut engine = Self::default();
         let mut report = ParseReport::default();
         engine.load_paths(block_paths, RuleTarget::Block, &mut report)?;
         engine.load_paths(allow_paths, RuleTarget::Allow, &mut report)?;
@@ -122,7 +114,6 @@ impl BlocklistEngine {
         }
     }
 
-    // Exception rules win over block rules.
     pub fn decide(&self, domain: &str) -> BlockDecision {
         let normalized = normalize_domain(domain);
         if self.matches_exception(&normalized) {
@@ -183,7 +174,7 @@ impl ReloadableBlocklist {
     #[cfg(test)]
     pub fn new(paths: Vec<PathBuf>) -> Self {
         Self {
-            engine: RwLock::new(BlocklistEngine::empty()),
+            engine: RwLock::new(BlocklistEngine::default()),
             paths,
             allowlist_paths: Vec::new(),
             remote: RemoteBlocklists::default(),
@@ -194,7 +185,7 @@ impl ReloadableBlocklist {
 
     pub fn from_config(config: &BlocklistConfig) -> Self {
         Self {
-            engine: RwLock::new(BlocklistEngine::empty()),
+            engine: RwLock::new(BlocklistEngine::default()),
             paths: config.paths.clone(),
             allowlist_paths: config.allowlist_paths.clone(),
             remote: RemoteBlocklists {
@@ -372,10 +363,6 @@ impl fmt::Display for ParseReport {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Parsing internals
-// ---------------------------------------------------------------------------
-
 enum ParsedLine {
     Skip,
     Block(NormalizedRule),
@@ -414,13 +401,11 @@ fn parse_line(line: &str) -> ParsedLine {
 
     let mut rest = without_comment;
 
-    // Detect exception.
     let is_exception = rest.starts_with("@@");
     if is_exception {
         rest = &rest[2..];
     }
 
-    // Detect anchored rule `||domain^`.
     if rest.starts_with("||") {
         rest = &rest[2..];
         if rest.ends_with('^') {
@@ -438,8 +423,6 @@ fn parse_line(line: &str) -> ParsedLine {
         };
     }
 
-    // Detect hosts-style entries: `<ip> <domain>` or `<ip> <domain> <alias>...`
-    // Valid IPs start with digits, `::`, or `fe80` etc.
     if let Some(rule) = try_parse_hosts(rest) {
         return if is_exception {
             ParsedLine::Exception(rule)
@@ -481,13 +464,10 @@ fn try_parse_hosts(rest: &str) -> Option<NormalizedRule> {
 }
 
 fn looks_like_ip(token: &str) -> bool {
-    // IPv4 starts with digit, IPv6 with `:` or hex digit.
     token.starts_with(|c: char| c.is_ascii_digit() || c == ':')
 }
 
 fn looks_like_domain(domain: &str) -> bool {
-    // Minimal sanity check: contains at least one dot, no spaces,
-    // no slashes (regex), and no asterisks.
     domain.contains('.')
         && domain.chars().all(|c| !c.is_whitespace())
         && !domain.starts_with('/')
@@ -512,10 +492,6 @@ fn domain_suffixes(domain: &str) -> impl Iterator<Item = &str> {
     })
 }
 
-// ---------------------------------------------------------------------------
-// Tests
-// ---------------------------------------------------------------------------
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -533,7 +509,7 @@ mod tests {
 
     #[test]
     fn plain_domain_blocks_exact_and_subdomains() {
-        let mut engine = BlocklistEngine::empty();
+        let mut engine = BlocklistEngine::default();
         engine
             .blocks
             .insert(NormalizedRule::Domain("example.com".into()));
@@ -547,7 +523,7 @@ mod tests {
 
     #[test]
     fn exception_overrides_block() {
-        let mut engine = BlocklistEngine::empty();
+        let mut engine = BlocklistEngine::default();
         engine
             .blocks
             .insert(NormalizedRule::Domain("example.com".into()));
@@ -575,7 +551,7 @@ mod tests {
 
     #[test]
     fn subdomain_exception_does_not_override_parent_block() {
-        let mut engine = BlocklistEngine::empty();
+        let mut engine = BlocklistEngine::default();
         engine
             .blocks
             .insert(NormalizedRule::Domain("example.com".into()));
@@ -583,11 +559,8 @@ mod tests {
             .exceptions
             .insert(NormalizedRule::Domain("sub.example.com".into()));
 
-        // sub.example.com is excepted.
         assert_eq!(engine.decide("sub.example.com"), BlockDecision::Exception);
-        // www.example.com is still blocked by the parent rule.
         assert_eq!(engine.decide("www.example.com"), BlockDecision::Block);
-        // example.com itself is still blocked.
         assert_eq!(engine.decide("example.com"), BlockDecision::Block);
     }
 
@@ -604,7 +577,6 @@ mod tests {
         assert_eq!(engine.block_count(), 0);
         assert_eq!(engine.exception_count(), 0);
         assert_eq!(report.unsupported, 0);
-        // 5 lines: empty, comment, comment, blank, spaces
         assert_eq!(report.total, 5);
     }
 
@@ -620,9 +592,7 @@ example.com
 "#;
         let file = make_temp_file(content);
         let (_, report) = BlocklistEngine::from_paths(&[file.path().to_path_buf()]).unwrap();
-        // 7 lines: empty, comment, comment, blank, example.com, ||tracker.com^, /example.*banner/
         assert_eq!(report.total, 7);
-        // Only the regex rule is unsupported.
         assert_eq!(report.unsupported, 1);
     }
 
@@ -746,7 +716,6 @@ supported.example
         let reloadable = ReloadableBlocklist::from_engine(engine, paths);
         assert_eq!(reloadable.decide("old.com"), BlockDecision::Block);
 
-        // Replace file contents and reload.
         let mut file = std::fs::OpenOptions::new()
             .write(true)
             .truncate(true)
@@ -772,7 +741,7 @@ supported.example
 
     #[test]
     fn case_insensitive_matching() {
-        let mut engine = BlocklistEngine::empty();
+        let mut engine = BlocklistEngine::default();
         engine
             .blocks
             .insert(NormalizedRule::Domain("example.com".into()));

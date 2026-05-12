@@ -22,7 +22,6 @@ use reqwest::Client as HttpClient;
 
 // DoT
 use rustls::pki_types::ServerName;
-use std::sync::Arc as RustlsArc;
 use tokio_rustls::TlsConnector;
 
 #[derive(Debug, thiserror::Error, Clone)]
@@ -70,7 +69,6 @@ fn format_error_chain(error: &dyn Error) -> String {
     message
 }
 
-// strip port for SNI
 fn extract_host(address: &str) -> &str {
     if let Some(rest) = address.strip_prefix('[') {
         if let Some((host, _)) = rest.split_once(']') {
@@ -82,9 +80,6 @@ fn extract_host(address: &str) -> &str {
     address
 }
 
-// --- Upstream Enum ---
-
-/// Upstream wrapper enum.
 #[derive(Debug, Clone)]
 pub enum Upstream {
     Plain(PlainUpstream),
@@ -103,10 +98,14 @@ impl Upstream {
             ));
         }
         match entry.protocol {
-            UpstreamProtocol::Plain => Ok(Upstream::Plain(PlainUpstream::new(&entry.address))),
+            UpstreamProtocol::Plain => Ok(Upstream::Plain(PlainUpstream::new(
+                &entry.address,
+                entry.timeout,
+            ))),
             UpstreamProtocol::Tls => Ok(Upstream::Dot(DotUpstream::new(
                 &entry.address,
                 bootstrap_dns,
+                entry.timeout,
             )?)),
             UpstreamProtocol::Https => Ok(Upstream::Doh(DohUpstream::new(entry, bootstrap_dns)?)),
         }
@@ -130,8 +129,6 @@ impl Upstream {
     }
 }
 
-// --- Plain DNS ---
-
 #[derive(Debug, Clone)]
 pub struct PlainUpstream {
     address: String,
@@ -139,10 +136,10 @@ pub struct PlainUpstream {
 }
 
 impl PlainUpstream {
-    pub fn new(address: &str) -> Self {
+    pub fn new(address: &str, timeout: Duration) -> Self {
         Self {
             address: address.to_string(),
-            timeout: Duration::from_secs(5),
+            timeout,
         }
     }
 
@@ -198,7 +195,6 @@ impl PlainUpstream {
     }
 }
 
-// check TC bit in DNS header
 fn is_truncated(msg: &Message) -> bool {
     // Hickory Message doesn't expose raw header bytes directly in a stable way.
     // Serialize and inspect the wire-format header directly.
@@ -208,19 +204,21 @@ fn is_truncated(msg: &Message) -> bool {
     }
 }
 
-// --- DoT ---
-
 #[derive(Debug, Clone)]
 pub struct DotUpstream {
     address: String,
     hostname: String,
     endpoints: Vec<SocketAddr>,
     timeout: Duration,
-    tls_config: RustlsArc<rustls::ClientConfig>,
+    tls_config: Arc<rustls::ClientConfig>,
 }
 
 impl DotUpstream {
-    pub fn new(address: &str, bootstrap_dns: &[SocketAddr]) -> Result<Self, UpstreamError> {
+    pub fn new(
+        address: &str,
+        bootstrap_dns: &[SocketAddr],
+        timeout: Duration,
+    ) -> Result<Self, UpstreamError> {
         let mut root_store = rustls::RootCertStore::empty();
         root_store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
 
@@ -235,8 +233,8 @@ impl DotUpstream {
             address: address.to_string(),
             hostname,
             endpoints,
-            timeout: Duration::from_secs(5),
-            tls_config: RustlsArc::new(tls_config),
+            timeout,
+            tls_config: Arc::new(tls_config),
         })
     }
 
@@ -287,8 +285,6 @@ impl DotUpstream {
     }
 }
 
-// --- DoH ---
-
 #[derive(Debug, Clone)]
 pub struct DohUpstream {
     url: String,
@@ -314,12 +310,12 @@ impl DohUpstream {
         let resolved_addrs = resolve_host(host, port, bootstrap_dns)?;
         let endpoints = resolved_addrs
             .into_iter()
-            .map(|addr| build_doh_endpoint(host, addr))
+            .map(|addr| build_doh_endpoint(host, addr, entry.timeout))
             .collect::<Result<Vec<_>, _>>()?;
 
         Ok(Self {
             url,
-            timeout: Duration::from_secs(5),
+            timeout: entry.timeout,
             endpoints,
         })
     }
@@ -377,10 +373,15 @@ impl DohUpstream {
     }
 }
 
-fn build_doh_endpoint(host: &str, addr: SocketAddr) -> Result<DohEndpoint, UpstreamError> {
+fn build_doh_endpoint(
+    host: &str,
+    addr: SocketAddr,
+    request_timeout: Duration,
+) -> Result<DohEndpoint, UpstreamError> {
+    let client_timeout = request_timeout.saturating_add(Duration::from_secs(5));
     let client = HttpClient::builder()
         .https_only(true)
-        .timeout(Duration::from_secs(10))
+        .timeout(client_timeout.max(Duration::from_secs(10)))
         .resolve(host, addr)
         .build()
         .map_err(|e| UpstreamError::Network(format_error_chain(&e)))?;
@@ -523,8 +524,6 @@ fn port_from_address(address: &str) -> Option<u16> {
     address.rsplit_once(':')?.1.parse().ok()
 }
 
-// --- Upstream Pool (fallback) ---
-
 #[derive(Debug, Clone)]
 pub struct UpstreamPool {
     upstreams: Vec<(Upstream, String)>,
@@ -541,11 +540,19 @@ impl UpstreamPool {
 
         for (upstream, name) in &self.upstreams {
             match upstream.query(message).await {
-                Ok(response) => return Ok(response),
+                Ok(response) => {
+                    if let Some(m) = &self.metrics {
+                        m.record_upstream_success();
+                    }
+                    return Ok(response);
+                }
                 Err(e) => {
                     tracing::warn!(upstream = %name, error = %e, "upstream query failed");
-                    last_err = Some(e);
+                    last_err = Some(e.clone());
                     if let Some(m) = &self.metrics {
+                        if matches!(e, UpstreamError::Timeout) {
+                            m.record_upstream_timeout();
+                        }
                         m.record_upstream_failure();
                     }
                 }
@@ -568,10 +575,6 @@ pub fn pool_from_config(
     }
     Ok(UpstreamPool::new(upstreams, metrics))
 }
-
-// ------------------------------------------------------------------
-// Tests
-// ------------------------------------------------------------------
 
 #[cfg(test)]
 mod tests {
@@ -667,10 +670,6 @@ mod tests {
         (handle, addr)
     }
 
-    // ------------------------------------------------------------------
-    // Config mapping
-    // ------------------------------------------------------------------
-
     #[test]
     fn upstream_from_plain_config() {
         let entry = UpstreamEntry {
@@ -678,6 +677,7 @@ mod tests {
             address: "8.8.8.8:53".into(),
             protocol: UpstreamProtocol::Plain,
             tls_cert_path: None,
+            timeout: Duration::from_secs(5),
         };
         let upstream = Upstream::from_entry(&entry, &[]).unwrap();
         assert!(matches!(upstream, Upstream::Plain(_)));
@@ -692,6 +692,7 @@ mod tests {
             address: "cloudflare-dns.com:853".into(),
             protocol: UpstreamProtocol::Tls,
             tls_cert_path: None,
+            timeout: Duration::from_secs(5),
         };
         let upstream = Upstream::from_entry(&entry, &[]).unwrap();
         assert!(matches!(upstream, Upstream::Dot(_)));
@@ -705,6 +706,7 @@ mod tests {
             address: "https://cloudflare-dns.com/dns-query".into(),
             protocol: UpstreamProtocol::Https,
             tls_cert_path: None,
+            timeout: Duration::from_secs(5),
         };
         let upstream = Upstream::from_entry(&entry, &[]).unwrap();
         assert!(matches!(upstream, Upstream::Doh(_)));
@@ -755,6 +757,7 @@ mod tests {
             address: "cloudflare-dns.com:853".into(),
             protocol: UpstreamProtocol::Tls,
             tls_cert_path: Some(PathBuf::from("/some/cert.pem")),
+            timeout: Duration::from_secs(5),
         };
         let err = Upstream::from_entry(&entry, &[]).unwrap_err();
         assert!(matches!(err, UpstreamError::UnsupportedFeature(_)));
@@ -769,15 +772,11 @@ mod tests {
         assert_eq!(extract_host("[::1]:853"), "::1");
     }
 
-    // ------------------------------------------------------------------
-    // Plain transport
-    // ------------------------------------------------------------------
-
     #[tokio::test]
     async fn plain_udp_query_happy_path() {
         let (_handle, addr) = start_mock_udp_server("127.0.0.1:0").await;
 
-        let upstream = PlainUpstream::new(&addr.to_string());
+        let upstream = PlainUpstream::new(&addr.to_string(), Duration::from_secs(5));
         let query = test_query();
         let response = upstream.query(&query).await.unwrap();
 
@@ -785,24 +784,21 @@ mod tests {
         assert_eq!(response.id(), query.id());
     }
 
-    // ------------------------------------------------------------------
-    // Fallback behaviour
-    // ------------------------------------------------------------------
-
     #[tokio::test]
     async fn pool_fallback_to_second_upstream() {
-        // Build a mock pool manually using the enum variants.
         let entry1 = UpstreamEntry {
             name: "fail".into(),
             address: "127.0.0.1:1".into(),
             protocol: UpstreamProtocol::Plain,
             tls_cert_path: None,
+            timeout: Duration::from_secs(5),
         };
         let entry2 = UpstreamEntry {
             name: "ok".into(),
             address: "127.0.0.1:0".into(),
             protocol: UpstreamProtocol::Plain,
             tls_cert_path: None,
+            timeout: Duration::from_secs(5),
         };
 
         let (_handle, ok_addr) = start_mock_udp_server("127.0.0.1:0").await;
@@ -814,7 +810,6 @@ mod tests {
         let pool = pool_from_config(&[entry1, entry2], &[], None).unwrap();
         let query = test_query();
 
-        // First upstream (127.0.0.1:1) will fail; second should succeed.
         let response = pool.query(&query).await.unwrap();
         assert_eq!(response.message_type(), MessageType::Response);
     }
@@ -826,6 +821,7 @@ mod tests {
             address: "127.0.0.1:1".into(),
             protocol: UpstreamProtocol::Plain,
             tls_cert_path: None,
+            timeout: Duration::from_secs(5),
         };
 
         let pool = pool_from_config(&[entry.clone(), entry], &[], None).unwrap();
@@ -844,6 +840,7 @@ mod tests {
             address: "127.0.0.1:1".into(),
             protocol: UpstreamProtocol::Plain,
             tls_cert_path: None,
+            timeout: Duration::from_secs(5),
         };
 
         let metrics = Arc::new(MetricsRecorder::new());
@@ -855,16 +852,11 @@ mod tests {
         assert_eq!(snap.upstream_failures, 2);
     }
 
-    // ------------------------------------------------------------------
-    // Truncation / TCP fallback (plain)
-    // ------------------------------------------------------------------
-
     #[test]
     fn truncated_bit_detection() {
         // Build a message and manually set the TC bit by mutating raw bytes.
         let msg = test_query();
         let mut bytes = msg.to_bytes().unwrap();
-        // Set TC bit (byte 2, bit 1).
         bytes[2] |= 0x02;
         let msg_with_tc = Message::from_bytes(&bytes).unwrap();
         assert!(is_truncated(&msg_with_tc));

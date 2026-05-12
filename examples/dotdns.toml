@@ -22,16 +22,19 @@ dns = ["1.1.1.1:53", "1.0.0.1:53"]
 name = "cloudflare-dot"
 address = "cloudflare-dns.com:853"
 protocol = "dot"
+timeout = "5s"
 
 [[upstreams]]
 name = "cloudflare-doh"
 address = "https://cloudflare-dns.com/dns-query"
 protocol = "doh"
+timeout = "5s"
 
 [[upstreams]]
 name = "google-plain"
 address = "8.8.8.8:53"
 protocol = "plain"
+timeout = "5s"
 
 [cache]
 capacity = 10000

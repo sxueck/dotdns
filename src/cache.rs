@@ -72,7 +72,6 @@ impl Cache {
         }
     }
 
-    // Returns None if expired or missing.
     pub fn get(&self, query: &Message) -> Option<Message> {
         let key = CacheKey::from_message(query)?;
         let mut inner = self.inner.lock().unwrap();
@@ -147,6 +146,7 @@ impl Cache {
         if inner.entries.len() >= inner.config.capacity {
             if let Some(k) = inner.entries.keys().next().cloned() {
                 inner.entries.remove(&k);
+                inner.metrics.record_cache_eviction();
             }
         }
 
