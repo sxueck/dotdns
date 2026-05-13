@@ -89,6 +89,11 @@ path = "/run/dotdns/dotdns.sock"
 # every 60 seconds and on graceful shutdown so they survive restarts.
 # stats_path = "/var/lib/dotdns/stats.json"
 
+# Uncomment to enable DNS-over-HTTPS serving on a separate port.
+# [doh]
+# binds = ["0.0.0.0:443", "[::]:443"]
+# idle_timeout = "60s"
+
 [logging]
 level = "info"
 format = "pretty"

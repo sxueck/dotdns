@@ -2,6 +2,7 @@ mod blocklist;
 mod cache;
 mod cli;
 mod config;
+mod doh;
 mod management;
 mod metrics;
 mod server;
@@ -196,7 +197,7 @@ async fn run_serve(cfg: Config) {
         metrics.clone(),
         cache.clone(),
         blocklist.clone(),
-        pool,
+        pool.clone(),
     );
     let mgmt_server = ManagementServer::new(
         cfg.management.clone(),
@@ -204,6 +205,24 @@ async fn run_serve(cfg: Config) {
         cache.clone(),
         blocklist.clone(),
     );
+    let doh_server = cfg.doh.as_ref().map(|_| {
+        let doh_state = doh::DohState {
+            metrics: metrics.clone(),
+            cache: cache.clone(),
+            blocklist: blocklist.clone(),
+            pool: pool.clone(),
+            pending: server::PendingQueries::new(metrics.clone()),
+            edns: cfg.edns.clone(),
+            blocklist_config: cfg.blocklist.clone(),
+        };
+        match doh::DohServer::new(&cfg, doh_state) {
+            Ok(s) => s,
+            Err(e) => {
+                eprintln!("failed to build DoH server: {}", e);
+                std::process::exit(1);
+            }
+        }
+    });
 
     let metrics_for_save = metrics.clone();
     let stats_path = cfg.stats_path.clone();
@@ -225,6 +244,10 @@ async fn run_serve(cfg: Config) {
     info!("listening on {:?} (DoT)", cfg.server.binds);
     info!("upstreams: {}", cfg.upstreams.len());
 
+    if let Some(ref doh_cfg) = cfg.doh {
+        info!("DoH listening on {:?}", doh_cfg.binds);
+    }
+
     tokio::select! {
         result = server.run() => {
             if let Err(e) = result {
@@ -235,6 +258,17 @@ async fn run_serve(cfg: Config) {
         result = mgmt_server.run() => {
             if let Err(e) = result {
                 eprintln!("management server error: {}", e);
+                std::process::exit(1);
+            }
+        }
+        result = async {
+            match doh_server {
+                Some(s) => s.run().await,
+                None => std::future::pending().await,
+            }
+        } => {
+            if let Err(e) = result {
+                eprintln!("DoH server error: {}", e);
                 std::process::exit(1);
             }
         }

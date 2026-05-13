@@ -45,6 +45,8 @@ pub struct Config {
     pub logging: LoggingConfig,
     #[serde(default = "default_stats_path")]
     pub stats_path: PathBuf,
+    #[serde(default)]
+    pub doh: Option<DohConfig>,
 }
 
 impl Config {
@@ -101,6 +103,20 @@ impl Config {
         }
         if self.tls.cert_path.is_some() != self.tls.key_path.is_some() {
             return Err(ConfigError::TlsIncomplete);
+        }
+        if let Some(doh) = &self.doh {
+            if doh.binds.is_empty() {
+                return Err(ConfigError::InvalidValue {
+                    field: "doh.binds".into(),
+                    message: "at least one listen address is required".into(),
+                });
+            }
+            if self.tls.cert_path.is_none() {
+                return Err(ConfigError::InvalidValue {
+                    field: "doh".into(),
+                    message: "DoH requires TLS certificate".into(),
+                });
+            }
         }
         if let ManagementTransport::Tcp { bind } = &self.management.transport {
             if !is_loopback(bind) {
@@ -180,6 +196,13 @@ fn host_from_address(address: &str) -> &str {
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct ServerConfig {
+    pub binds: Vec<SocketAddr>,
+    #[serde(default = "default_idle_timeout", with = "humantime_serde")]
+    pub idle_timeout: Duration,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct DohConfig {
     pub binds: Vec<SocketAddr>,
     #[serde(default = "default_idle_timeout", with = "humantime_serde")]
     pub idle_timeout: Duration,
@@ -797,5 +820,68 @@ address = "1.1.1.1:53"
             cfg.management.transport,
             ManagementTransport::Unix { .. }
         ));
+    }
+
+    #[test]
+    fn parse_doh_config() {
+        let source = r#"
+[server]
+binds = ["0.0.0.0:853"]
+
+[tls]
+cert_path = "/etc/dotdns/cert.pem"
+key_path = "/etc/dotdns/key.pem"
+
+[doh]
+binds = ["0.0.0.0:443"]
+idle_timeout = "2m"
+
+[[upstreams]]
+name = "cf"
+address = "1.1.1.1:53"
+"#;
+        let cfg = Config::from_toml(source).unwrap();
+        let doh = cfg.doh.unwrap();
+        assert_eq!(doh.binds.len(), 1);
+        assert_eq!(doh.binds[0].port(), 443);
+        assert_eq!(doh.idle_timeout, Duration::from_secs(120));
+    }
+
+    #[test]
+    fn reject_doh_without_tls() {
+        let source = r#"
+[server]
+binds = ["0.0.0.0:853"]
+
+[doh]
+binds = ["0.0.0.0:443"]
+
+[[upstreams]]
+name = "cf"
+address = "1.1.1.1:53"
+"#;
+        let err = Config::from_toml(source).unwrap_err();
+        assert!(matches!(err, ConfigError::InvalidValue { field, .. } if field == "doh"));
+    }
+
+    #[test]
+    fn reject_empty_doh_binds() {
+        let source = r#"
+[server]
+binds = ["0.0.0.0:853"]
+
+[tls]
+cert_path = "/etc/dotdns/cert.pem"
+key_path = "/etc/dotdns/key.pem"
+
+[doh]
+binds = []
+
+[[upstreams]]
+name = "cf"
+address = "1.1.1.1:53"
+"#;
+        let err = Config::from_toml(source).unwrap_err();
+        assert!(matches!(err, ConfigError::InvalidValue { field, .. } if field == "doh.binds"));
     }
 }

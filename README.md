@@ -1,11 +1,12 @@
 # dotdns
 
-`dotdns` is a Rust single-node DNS-over-TLS (DoT) forwarding cache resolver. It listens for DoT client queries, forwards misses to configured upstream resolvers, caches eligible DNS responses by TTL, and can apply an AdGuard Home-compatible DNS blocklist subset.
+`dotdns` is a Rust single-node DNS-over-TLS (DoT) and optional DNS-over-HTTPS (DoH) forwarding cache resolver. It listens for encrypted client DNS queries, forwards misses to configured upstream resolvers, caches eligible DNS responses by TTL, and can apply an AdGuard Home-compatible DNS blocklist subset.
 
 ## Deployment
 
-- Public client-facing service: DoT on port `853`.
+- Public client-facing service: DoT on port `853`; optional DoH on `/dns-query`.
 - DoT listen addresses are configured with `server.binds`; include both `"0.0.0.0:853"` and `"[::]:853"` to listen on IPv4 and IPv6.
+- DoH listen addresses are configured with `[doh].binds`. Use public `:443` binds for direct serving, or loopback/non-standard binds such as `"127.0.0.1:8443"` when another proxy handles the public endpoint.
 - TLS certificate and private key are provided by the operator via `tls.cert_path` and `tls.key_path`.
 - Binding port `853` as a non-root user may require elevated permissions or a platform-specific capability such as `CAP_NET_BIND_SERVICE` on Linux.
 - The management interface is local-only by default. The example systemd deployment uses Unix socket `/run/dotdns/dotdns.sock`.
@@ -35,6 +36,64 @@ DoT upstreams must use a hostname, not a raw IP address, so TLS SNI and certific
 Each upstream can set its own `timeout` (default `5s`). This controls how long dotdns waits for a single query on that upstream before falling back to the next one.
 
 DoT and DoH upstream hostnames are resolved once when the upstream pool is built. Configure global `[bootstrap].dns` servers to resolve those hostnames through plain DNS at startup; when empty, dotdns uses the system resolver. DoH endpoints are injected into per-endpoint HTTPS clients, so steady-state queries do not need to resolve the DoH hostname through `dotdns` itself and a bad endpoint does not poison the whole DoH upstream.
+
+### Serving DNS-over-HTTPS
+
+Enable client-facing DoH with an optional `[doh]` section:
+
+```toml
+[doh]
+binds = ["0.0.0.0:443", "[::]:443"]
+idle_timeout = "60s"
+```
+
+DoH serves RFC 8484 requests on `/dns-query`:
+
+- `POST /dns-query` with `Content-Type: application/dns-message`
+- `GET /dns-query?dns=<base64url-no-padding-dns-message>`
+
+DoH uses the same cache, blocklist, upstream pool, pending-query coalescing, metrics, and EDNS Client Subnet behavior as DoT. The client IP is taken from the accepted TCP peer address, so direct serving sees the real client address. If dotdns is behind a proxy, dotdns sees the proxy address unless the proxy preserves the TCP peer address at a lower layer.
+
+The `[doh]` listener always expects TLS and requires `tls.cert_path` plus `tls.key_path`. This means loopback reverse-proxy deployments have two valid shapes:
+
+- TLS passthrough: nginx `stream` proxies TCP from public `:443` to dotdns, for example `127.0.0.1:8443`; dotdns terminates TLS and serves DoH.
+- HTTPS upstream proxying: nginx terminates public TLS and forwards to dotdns with `proxy_pass https://127.0.0.1:8443`; configure nginx upstream certificate verification/trust accordingly.
+
+Plain HTTP proxying to dotdns, such as `proxy_pass http://127.0.0.1:8443`, is not supported because dotdns does not expose a cleartext DoH listener.
+
+Example loopback bind for nginx fronting:
+
+```toml
+[doh]
+binds = ["127.0.0.1:8443"]
+idle_timeout = "60s"
+```
+
+Minimal nginx TLS passthrough example:
+
+```nginx
+stream {
+    server {
+        listen 443;
+        proxy_pass 127.0.0.1:8443;
+    }
+}
+```
+
+Minimal nginx HTTPS upstream example:
+
+```nginx
+server {
+    listen 443 ssl http2;
+    server_name dns.example.com;
+
+    location = /dns-query {
+        proxy_pass https://127.0.0.1:8443;
+        proxy_ssl_verify off;
+        proxy_set_header Host $host;
+    }
+}
+```
 
 ## CLI
 

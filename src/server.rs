@@ -210,7 +210,9 @@ pub fn validate_tls_config(config: &Config) -> Result<(), ServerError> {
     build_tls_server_config(config).map(|_| ())
 }
 
-fn build_tls_server_config(config: &Config) -> Result<rustls::ServerConfig, ServerError> {
+pub(crate) fn build_tls_server_config(
+    config: &Config,
+) -> Result<rustls::ServerConfig, ServerError> {
     let cert_path = config
         .tls
         .cert_path
@@ -295,7 +297,7 @@ async fn accept_loop(listener: TcpListener, ctx: ConnectionContext) -> Result<()
     }
 }
 
-fn bind_listener(addr: SocketAddr) -> Result<TcpListener, ServerError> {
+pub(crate) fn bind_listener(addr: SocketAddr) -> Result<TcpListener, ServerError> {
     let socket = if addr.is_ipv4() {
         Socket::new(Domain::IPV4, Type::STREAM, Some(Protocol::TCP))?
     } else {

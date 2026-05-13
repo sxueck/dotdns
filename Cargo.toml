@@ -21,6 +21,11 @@ webpki-roots = "0.26"
 rustls-pemfile = "2"
 socket2 = "0.6"
 x509-parser = "0.16"
+axum = "0.7"
+hyper = { version = "1", features = ["server", "http1"] }
+hyper-util = { version = "0.1", features = ["tokio", "server", "service", "http1"] }
+base64 = "0.22"
 
 [dev-dependencies]
 tempfile = "3"
+tower = { version = "0.5", features = ["util"] }
