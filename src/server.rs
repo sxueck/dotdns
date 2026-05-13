@@ -4,6 +4,7 @@ use crate::blocklist::ReloadableBlocklist;
 use crate::cache::Cache;
 use crate::config::{BlocklistConfig, BlocklistResponseMode, Config, EdnsConfig};
 use crate::metrics::MetricsRecorder;
+use crate::observability::ObservabilityRegistry;
 use crate::upstream::{UpstreamError, UpstreamPool};
 use hickory_proto::op::{Edns, Message, MessageType, ResponseCode};
 use hickory_proto::rr::rdata::opt::{ClientSubnet, EdnsCode, EdnsOption};
@@ -138,6 +139,7 @@ pub struct Server {
     blocklist: Arc<ReloadableBlocklist>,
     pool: UpstreamPool,
     pending: PendingQueries,
+    observability: Option<Arc<ObservabilityRegistry>>,
 }
 
 impl Server {
@@ -147,6 +149,7 @@ impl Server {
         cache: Arc<Cache>,
         blocklist: Arc<ReloadableBlocklist>,
         pool: UpstreamPool,
+        observability: Option<Arc<ObservabilityRegistry>>,
     ) -> Self {
         let pending = PendingQueries::new(metrics.clone());
         Self {
@@ -156,6 +159,7 @@ impl Server {
             blocklist,
             pool,
             pending,
+            observability,
         }
     }
 
@@ -184,6 +188,7 @@ impl Server {
                     edns: self.config.edns.clone(),
                     blocklist_config: self.config.blocklist.clone(),
                     idle_timeout,
+                    observability: self.observability.clone(),
                 },
             ));
         }
@@ -279,6 +284,7 @@ struct ConnectionContext {
     edns: EdnsConfig,
     blocklist_config: BlocklistConfig,
     idle_timeout: Duration,
+    observability: Option<Arc<ObservabilityRegistry>>,
 }
 
 async fn accept_loop(listener: TcpListener, ctx: ConnectionContext) -> Result<(), ServerError> {
@@ -286,13 +292,21 @@ async fn accept_loop(listener: TcpListener, ctx: ConnectionContext) -> Result<()
         let (stream, peer) = listener.accept().await?;
         let conn_ctx = ctx.clone();
         ctx.metrics.record_accepted_connection();
+        if let Some(obs) = &ctx.observability {
+            obs.record_client_connection_opened(peer.ip());
+        }
 
         let metrics = conn_ctx.metrics.clone();
+        let observability = conn_ctx.observability.clone();
+        let peer_ip = peer.ip();
         tokio::spawn(async move {
             if let Err(e) = handle_connection(stream, peer, conn_ctx).await {
                 tracing::debug!(peer = %peer, error = %e, "connection closed");
             }
             metrics.record_active_connection_closed();
+            if let Some(obs) = observability {
+                obs.record_client_connection_closed(peer_ip);
+            }
         });
     }
 }
@@ -358,6 +372,7 @@ async fn handle_connection(
                     client_ip: Some(peer.ip()),
                     edns: &ctx.edns,
                     blocklist_config: &ctx.blocklist_config,
+                    observability: ctx.observability.as_deref(),
                 };
                 let response = resolve_with_context(query, &resolve_ctx).await;
                 if let Err(e) = write_message(&mut tls_stream, &response, ctx.idle_timeout).await {
@@ -429,6 +444,7 @@ pub(crate) struct ResolveContext<'a> {
     pub(crate) client_ip: Option<IpAddr>,
     pub(crate) edns: &'a EdnsConfig,
     pub(crate) blocklist_config: &'a BlocklistConfig,
+    pub(crate) observability: Option<&'a ObservabilityRegistry>,
 }
 
 #[cfg(test)]
@@ -451,6 +467,7 @@ pub async fn resolve(
             client_ip: None,
             edns: &EdnsConfig::default(),
             blocklist_config: &BlocklistConfig::default(),
+            observability: None,
         },
     )
     .await
@@ -458,6 +475,11 @@ pub async fn resolve(
 
 pub(crate) async fn resolve_with_context(query: Message, ctx: &ResolveContext<'_>) -> Message {
     ctx.metrics.record_query();
+    if let Some(obs) = ctx.observability {
+        if let Some(ip) = ctx.client_ip {
+            obs.record_client_query(ip);
+        }
+    }
 
     let q = match query.queries().first() {
         Some(q) => q,
@@ -469,21 +491,56 @@ pub(crate) async fn resolve_with_context(query: Message, ctx: &ResolveContext<'_
     let domain = q.name().to_utf8();
     let domain = domain.trim_end_matches('.');
 
+    let upstream_query = query_with_ecs(&query, ctx.client_ip, ctx.edns);
+
     if ctx.blocklist.decide(domain).is_blocked() {
         ctx.metrics.record_blocked();
-        return make_blocked_response(&query, ctx.blocklist_config);
-    }
+        if let Some(obs) = ctx.observability {
+            if let Some(ip) = ctx.client_ip {
+                obs.record_client_blocked(ip);
+            }
+        }
+        if let Some(cached) = ctx.cache.get(&upstream_query) {
+            ctx.metrics.record_cache_hit();
+            if let Some(obs) = ctx.observability {
+                if let Some(ip) = ctx.client_ip {
+                    obs.record_client_cache_hit(ip);
+                }
+            }
+            let mut resp = cached;
+            resp.set_id(query.id());
+            return resp;
+        }
 
-    let upstream_query = query_with_ecs(&query, ctx.client_ip, ctx.edns);
+        ctx.metrics.record_cache_miss();
+        if let Some(obs) = ctx.observability {
+            if let Some(ip) = ctx.client_ip {
+                obs.record_client_cache_miss(ip);
+            }
+        }
+        let response = make_blocked_response(&query, ctx.blocklist_config);
+        ctx.cache.insert(&upstream_query, &response);
+        return response;
+    }
 
     if let Some(cached) = ctx.cache.get(&upstream_query) {
         ctx.metrics.record_cache_hit();
+        if let Some(obs) = ctx.observability {
+            if let Some(ip) = ctx.client_ip {
+                obs.record_client_cache_hit(ip);
+            }
+        }
         let mut resp = cached;
         resp.set_id(query.id());
         return resp;
     }
 
     ctx.metrics.record_cache_miss();
+    if let Some(obs) = ctx.observability {
+        if let Some(ip) = ctx.client_ip {
+            obs.record_client_cache_miss(ip);
+        }
+    }
 
     match ctx.pending.query(ctx.pool, &upstream_query).await {
         Ok(mut response) => {
@@ -855,7 +912,7 @@ mod tests {
             tls_cert_path: None,
             timeout: Duration::from_secs(5),
         };
-        let pool = pool_from_config(&[entry], &[], None).unwrap();
+        let pool = pool_from_config(&[entry], &[], None, None).unwrap();
 
         let query = test_query("blocked.com.", RecordType::A);
         let resp = resolve(query, &metrics, &cache, &blocklist, &pool).await;
@@ -875,7 +932,7 @@ mod tests {
         let blocklist = Arc::new(ReloadableBlocklist::from_engine(engine, vec![]));
         let metrics = Arc::new(MetricsRecorder::new());
         let cache = Arc::new(Cache::new(CacheConfig::default(), metrics.clone()));
-        let pool = UpstreamPool::new(vec![], None);
+        let pool = UpstreamPool::new(vec![], None, None);
 
         let query = test_query("blocked.com.", RecordType::A);
         let resp = resolve(query, &metrics, &cache, &blocklist, &pool).await;
@@ -892,7 +949,7 @@ mod tests {
         let blocklist = Arc::new(ReloadableBlocklist::from_engine(engine, vec![]));
         let metrics = Arc::new(MetricsRecorder::new());
         let cache = Arc::new(Cache::new(CacheConfig::default(), metrics.clone()));
-        let pool = UpstreamPool::new(vec![], None);
+        let pool = UpstreamPool::new(vec![], None, None);
 
         let query = test_query("blocked.com.", RecordType::AAAA);
         let resp = resolve(query, &metrics, &cache, &blocklist, &pool).await;
@@ -911,7 +968,7 @@ mod tests {
         let blocklist = Arc::new(ReloadableBlocklist::from_engine(engine, vec![]));
         let metrics = Arc::new(MetricsRecorder::new());
         let cache = Arc::new(Cache::new(CacheConfig::default(), metrics.clone()));
-        let pool = UpstreamPool::new(vec![], None);
+        let pool = UpstreamPool::new(vec![], None, None);
 
         let query = test_query("blocked.com.", RecordType::MX);
         let resp = resolve(query, &metrics, &cache, &blocklist, &pool).await;
@@ -919,6 +976,133 @@ mod tests {
         assert_eq!(resp.response_code(), ResponseCode::NoError);
         assert_eq!(resp.answers().len(), 0);
         assert_eq!(resp.name_servers().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn resolver_caches_blocked_null_ip_and_rewrites_cached_id() {
+        let mut engine = BlocklistEngine::default();
+        engine.add_block("blocked.com");
+        let blocklist = Arc::new(ReloadableBlocklist::from_engine(engine, vec![]));
+        let metrics = Arc::new(MetricsRecorder::new());
+        let cache = Arc::new(Cache::new(CacheConfig::default(), metrics.clone()));
+        let pool = UpstreamPool::new(vec![], None, None);
+
+        let mut query1 = test_query("blocked.com.", RecordType::A);
+        query1.set_id(1001);
+        let mut query2 = test_query("blocked.com.", RecordType::A);
+        query2.set_id(2002);
+
+        let resp1 = resolve(query1.clone(), &metrics, &cache, &blocklist, &pool).await;
+        let resp2 = resolve(query2.clone(), &metrics, &cache, &blocklist, &pool).await;
+
+        assert_eq!(resp1.id(), query1.id());
+        assert_eq!(resp2.id(), query2.id());
+        assert_eq!(resp2.response_code(), ResponseCode::NoError);
+        assert_eq!(resp2.answers().len(), 1);
+        assert_eq!(cache.len(), 1);
+        let snap = metrics.snapshot();
+        assert_eq!(snap.cache_misses, 1);
+        assert_eq!(snap.cache_hits, 1);
+        assert_eq!(snap.upstream_failures, 0);
+    }
+
+    #[tokio::test]
+    async fn resolver_caches_blocked_no_data_and_rewrites_cached_id() {
+        let mut engine = BlocklistEngine::default();
+        engine.add_block("blocked.com");
+        let blocklist = Arc::new(ReloadableBlocklist::from_engine(engine, vec![]));
+        let metrics = Arc::new(MetricsRecorder::new());
+        let cache = Arc::new(Cache::new(CacheConfig::default(), metrics.clone()));
+        let pool = UpstreamPool::new(vec![], None, None);
+        let pending = PendingQueries::new(metrics.clone());
+        let edns = EdnsConfig::default();
+        let blocklist_config = BlocklistConfig {
+            response_mode: BlocklistResponseMode::NoData,
+            blocked_ttl: Duration::from_secs(60),
+            ..BlocklistConfig::default()
+        };
+        let ctx = ResolveContext {
+            metrics: &metrics,
+            cache: &cache,
+            blocklist: &blocklist,
+            pool: &pool,
+            pending: &pending,
+            client_ip: None,
+            edns: &edns,
+            blocklist_config: &blocklist_config,
+            observability: None,
+        };
+
+        let mut query1 = test_query("blocked.com.", RecordType::A);
+        query1.set_id(3003);
+        let mut query2 = test_query("blocked.com.", RecordType::A);
+        query2.set_id(4004);
+
+        let resp1 = resolve_with_context(query1.clone(), &ctx).await;
+        let resp2 = resolve_with_context(query2.clone(), &ctx).await;
+
+        assert_eq!(resp1.id(), query1.id());
+        assert_eq!(resp2.id(), query2.id());
+        assert_eq!(resp2.response_code(), ResponseCode::NoError);
+        assert!(resp2.answers().is_empty());
+        assert_eq!(resp2.name_servers().len(), 1);
+        assert_eq!(cache.len(), 1);
+        let snap = metrics.snapshot();
+        assert_eq!(snap.cache_misses, 1);
+        assert_eq!(snap.cache_hits, 1);
+        assert_eq!(snap.upstream_failures, 0);
+    }
+
+    #[tokio::test]
+    async fn resolver_blocked_cache_key_includes_ecs() {
+        let mut engine = BlocklistEngine::default();
+        engine.add_block("blocked.com");
+        let blocklist = Arc::new(ReloadableBlocklist::from_engine(engine, vec![]));
+        let metrics = Arc::new(MetricsRecorder::new());
+        let cache = Arc::new(Cache::new(CacheConfig::default(), metrics.clone()));
+        let pool = UpstreamPool::new(vec![], None, None);
+        let pending = PendingQueries::new(metrics.clone());
+        let edns = ecs_config();
+        let blocklist_config = BlocklistConfig::default();
+
+        let ctx_a = ResolveContext {
+            metrics: &metrics,
+            cache: &cache,
+            blocklist: &blocklist,
+            pool: &pool,
+            pending: &pending,
+            client_ip: Some(IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8))),
+            edns: &edns,
+            blocklist_config: &blocklist_config,
+            observability: None,
+        };
+        let ctx_b = ResolveContext {
+            client_ip: Some(IpAddr::V4(Ipv4Addr::new(1, 1, 1, 1))),
+            ..ctx_a
+        };
+        let ctx_same_subnet = ResolveContext {
+            client_ip: Some(IpAddr::V4(Ipv4Addr::new(8, 8, 8, 9))),
+            ..ctx_a
+        };
+
+        let mut query1 = test_query("blocked.com.", RecordType::A);
+        query1.set_id(5005);
+        let mut query2 = test_query("blocked.com.", RecordType::A);
+        query2.set_id(6006);
+        let mut query3 = test_query("blocked.com.", RecordType::A);
+        query3.set_id(7007);
+
+        let resp1 = resolve_with_context(query1.clone(), &ctx_a).await;
+        let resp2 = resolve_with_context(query2.clone(), &ctx_b).await;
+        let resp3 = resolve_with_context(query3.clone(), &ctx_same_subnet).await;
+
+        assert_eq!(resp1.id(), query1.id());
+        assert_eq!(resp2.id(), query2.id());
+        assert_eq!(resp3.id(), query3.id());
+        assert_eq!(cache.len(), 2);
+        let snap = metrics.snapshot();
+        assert_eq!(snap.cache_misses, 2);
+        assert_eq!(snap.cache_hits, 1);
     }
 
     #[test]
@@ -970,7 +1154,7 @@ mod tests {
             tls_cert_path: None,
             timeout: Duration::from_secs(5),
         };
-        let pool = pool_from_config(&[entry], &[], None).unwrap();
+        let pool = pool_from_config(&[entry], &[], None, None).unwrap();
         let metrics = Arc::new(MetricsRecorder::new());
         let pending = PendingQueries::new(metrics);
         let mut query1 = test_query("example.com.", RecordType::A);
@@ -1006,7 +1190,7 @@ mod tests {
             tls_cert_path: None,
             timeout: Duration::from_secs(5),
         };
-        let pool = pool_from_config(&[entry], &[], None).unwrap();
+        let pool = pool_from_config(&[entry], &[], None, None).unwrap();
         let pending_for_task = pending.clone();
         let task = tokio::spawn(async move { pending_for_task.query(&pool, &query).await });
 
@@ -1035,7 +1219,7 @@ mod tests {
         let metrics = Arc::new(MetricsRecorder::new());
         let cache = Arc::new(Cache::new(CacheConfig::default(), metrics.clone()));
         let blocklist = Arc::new(ReloadableBlocklist::new(vec![]));
-        let pool = pool_from_config(&[entry], &[], None).unwrap();
+        let pool = pool_from_config(&[entry], &[], None, None).unwrap();
         let pending = PendingQueries::new(metrics.clone());
         let edns = EdnsConfig::default();
         let blocklist_config = BlocklistConfig::default();
@@ -1054,6 +1238,7 @@ mod tests {
             client_ip: None,
             edns: &edns,
             blocklist_config: &blocklist_config,
+            observability: None,
         };
         let (resp1, resp2) = tokio::join!(
             resolve_with_context(query1.clone(), &ctx),
@@ -1079,7 +1264,7 @@ mod tests {
         let metrics = Arc::new(MetricsRecorder::new());
         let cache = Arc::new(Cache::new(CacheConfig::default(), metrics.clone()));
         let blocklist = Arc::new(ReloadableBlocklist::new(vec![]));
-        let pool = pool_from_config(&[entry], &[], None).unwrap();
+        let pool = pool_from_config(&[entry], &[], None, None).unwrap();
 
         let query = test_query("example.com.", RecordType::A);
         let resp1 = resolve(query.clone(), &metrics, &cache, &blocklist, &pool).await;
@@ -1108,7 +1293,7 @@ mod tests {
         let metrics = Arc::new(MetricsRecorder::new());
         let cache = Arc::new(Cache::new(CacheConfig::default(), metrics.clone()));
         let blocklist = Arc::new(ReloadableBlocklist::new(vec![]));
-        let pool = pool_from_config(&[entry], &[], None).unwrap();
+        let pool = pool_from_config(&[entry], &[], None, None).unwrap();
 
         let query = test_query_with_edns("example.com.", RecordType::A);
         let resp = resolve(query.clone(), &metrics, &cache, &blocklist, &pool).await;

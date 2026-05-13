@@ -1,15 +1,3 @@
-//! AdGuard Home-compatible blocklist parsing and matching.
-//!
-//! Supports a documented subset of AdGuard rules:
-//! - Comments (`#`, `!`) and blank lines.
-//! - Plain domain rules (`example.com`).
-//! - Hosts-style entries (`127.0.0.1 example.com`, `0.0.0.0 example.com`).
-//! - Anchored domain rules (`||example.com^`).
-//! - Exception rules (`@@example.com`, `@@||example.com^`).
-//!
-//! Unsupported features (modifiers after `$`, regex rules, CSS rules, etc.)
-//! are skipped during parsing without crashing.
-
 use std::collections::HashSet;
 use std::fmt;
 use std::fs;
@@ -159,7 +147,6 @@ impl BlocklistEngine {
     }
 }
 
-/// Thread-safe reloadable wrapper.
 #[derive(Debug)]
 pub struct ReloadableBlocklist {
     engine: RwLock<BlocklistEngine>,
@@ -444,7 +431,6 @@ fn parse_line(line: &str) -> ParsedLine {
     }
 }
 
-/// Try to interpret `rest` as a hosts-style line.
 fn try_parse_hosts(rest: &str) -> Option<NormalizedRule> {
     let parts: Vec<&str> = rest.split_whitespace().collect();
     if parts.len() < 2 {
@@ -474,7 +460,6 @@ fn looks_like_domain(domain: &str) -> bool {
         && !domain.contains('*')
 }
 
-/// Yield the domain and each parent domain suffix that could match a rule.
 fn domain_suffixes(domain: &str) -> impl Iterator<Item = &str> {
     let mut start = 0usize;
     std::iter::from_fn(move || {

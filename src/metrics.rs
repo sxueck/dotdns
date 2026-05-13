@@ -3,7 +3,6 @@ use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
 
-/// Simple atomic metrics.
 #[derive(Debug)]
 pub struct MetricsRecorder {
     start_time: Instant,
@@ -127,7 +126,10 @@ impl MetricsRecorder {
     }
 
     pub fn record_active_connection_closed(&self) {
-        self.active_connections.fetch_sub(1, Ordering::Relaxed);
+        let current = self.active_connections.load(Ordering::Relaxed);
+        if current > 0 {
+            self.active_connections.fetch_sub(1, Ordering::Relaxed);
+        }
     }
 
     pub fn record_tls_handshake_success(&self) {
@@ -240,7 +242,6 @@ pub struct MetricsSnapshot {
     pub pending_follower_successes: u64,
 }
 
-/// Disk contract for persisting cumulative counters across restarts.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize, Serialize)]
 pub struct PersistedMetrics {
     pub total_queries: u64,
@@ -332,8 +333,6 @@ pub fn format_uptime(secs: u64) -> String {
     parts.join(" ")
 }
 
-/// Load persisted metrics from disk. Returns `None` if the file does not exist
-/// or is corrupted; in the corrupted case the file is removed.
 pub fn load_stats(path: &Path) -> Option<PersistedMetrics> {
     match std::fs::read_to_string(path) {
         Ok(content) => match serde_json::from_str(&content) {

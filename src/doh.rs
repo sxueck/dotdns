@@ -20,6 +20,7 @@ use crate::blocklist::ReloadableBlocklist;
 use crate::cache::Cache;
 use crate::config::{BlocklistConfig, Config, EdnsConfig};
 use crate::metrics::MetricsRecorder;
+use crate::observability::ObservabilityRegistry;
 use crate::server::{
     bind_listener, build_tls_server_config, resolve_with_context, PendingQueries, ResolveContext,
 };
@@ -34,6 +35,7 @@ pub(crate) struct DohState {
     pub(crate) pending: PendingQueries,
     pub(crate) edns: EdnsConfig,
     pub(crate) blocklist_config: BlocklistConfig,
+    pub(crate) observability: Option<Arc<ObservabilityRegistry>>,
 }
 
 pub struct DohServer {
@@ -103,7 +105,12 @@ async fn accept_loop(
         let acceptor = acceptor.clone();
         let service = TowerToHyperService::new(app.clone().layer(Extension(ConnectInfo(peer))));
         let metrics = state.metrics.clone();
+        let observability = state.observability.clone();
+        let peer_ip = peer.ip();
         metrics.record_accepted_connection();
+        if let Some(obs) = &observability {
+            obs.record_client_connection_opened(peer_ip);
+        }
 
         tokio::spawn(async move {
             let tls_stream = match acceptor.accept(stream).await {
@@ -114,6 +121,10 @@ async fn accept_loop(
                 Err(e) => {
                     metrics.record_tls_handshake_failure();
                     tracing::debug!(peer = %peer, error = %e, "tls handshake failed");
+                    metrics.record_active_connection_closed();
+                    if let Some(obs) = observability {
+                        obs.record_client_connection_closed(peer_ip);
+                    }
                     return;
                 }
             };
@@ -126,6 +137,10 @@ async fn accept_loop(
                 .serve_connection(io, service);
             if let Err(e) = conn.await {
                 tracing::debug!(peer = %peer, error = %e, "http connection error");
+            }
+            metrics.record_active_connection_closed();
+            if let Some(obs) = observability {
+                obs.record_client_connection_closed(peer_ip);
             }
         });
     }
@@ -205,6 +220,7 @@ async fn doh_resolve(query: Message, peer: SocketAddr, state: &DohState) -> Mess
         client_ip: Some(peer.ip()),
         edns: &state.edns,
         blocklist_config: &state.blocklist_config,
+        observability: state.observability.as_deref(),
     };
     resolve_with_context(query, &ctx).await
 }
@@ -243,10 +259,11 @@ mod tests {
             metrics: metrics.clone(),
             cache: Arc::new(Cache::new(CacheConfig::default(), metrics.clone())),
             blocklist: Arc::new(ReloadableBlocklist::new(vec![])),
-            pool: UpstreamPool::new(vec![], None),
+            pool: UpstreamPool::new(vec![], None, None),
             pending: PendingQueries::new(metrics),
             edns: EdnsConfig::default(),
             blocklist_config: BlocklistConfig::default(),
+            observability: None,
         }
     }
 
@@ -401,10 +418,11 @@ mod tests {
             metrics: metrics.clone(),
             cache: Arc::new(Cache::new(CacheConfig::default(), metrics.clone())),
             blocklist: Arc::new(ReloadableBlocklist::new(vec![])),
-            pool: pool_from_config(&[entry], &[], None).unwrap(),
+            pool: pool_from_config(&[entry], &[], None, None).unwrap(),
             pending: PendingQueries::new(metrics),
             edns: ecs_config(),
             blocklist_config: BlocklistConfig::default(),
+            observability: None,
         };
 
         let query = test_query("example.com.", RecordType::A);

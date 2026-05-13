@@ -5,6 +5,7 @@ mod config;
 mod doh;
 mod management;
 mod metrics;
+mod observability;
 mod server;
 mod upstream;
 
@@ -14,6 +15,7 @@ use crate::cli::{BlocklistCommands, CacheCommands, Cli, Commands};
 use crate::config::{Config, ManagementTransport};
 use crate::management::{ManagementClient, ManagementServer};
 use crate::metrics::{load_stats, save_stats, MetricsRecorder};
+use crate::observability::{ClientSnapshot, UpstreamSnapshot};
 use crate::server::Server;
 use clap::Parser;
 use std::fs;
@@ -93,7 +95,131 @@ async fn main() {
                 println!("blocklist reload requested");
             }
         },
+        Commands::Tracking { config } => {
+            let transport = load_mgmt_transport(config);
+            let client = ManagementClient::new(transport);
+            match client.tracking().await {
+                Ok(snap) => println!("{}", snap.to_human_string()),
+                Err(e) => {
+                    eprintln!("tracking: {}", e);
+                    std::process::exit(1);
+                }
+            }
+        }
+        Commands::Sources { config } => {
+            let transport = load_mgmt_transport(config);
+            let client = ManagementClient::new(transport);
+            match client.sources().await {
+                Ok(upstreams) => println!("{}", format_upstreams(&upstreams)),
+                Err(e) => {
+                    eprintln!("sources: {}", e);
+                    std::process::exit(1);
+                }
+            }
+        }
+        Commands::Sourcestats { config } => {
+            let transport = load_mgmt_transport(config);
+            let client = ManagementClient::new(transport);
+            match client.sourcestats().await {
+                Ok(upstreams) => println!("{}", format_upstreams(&upstreams)),
+                Err(e) => {
+                    eprintln!("sourcestats: {}", e);
+                    std::process::exit(1);
+                }
+            }
+        }
+        Commands::Activity { config } => {
+            let transport = load_mgmt_transport(config);
+            let client = ManagementClient::new(transport);
+            match client.activity().await {
+                Ok(snap) => println!("{}", format_activity(&snap)),
+                Err(e) => {
+                    eprintln!("activity: {}", e);
+                    std::process::exit(1);
+                }
+            }
+        }
+        Commands::Clients { config } => {
+            let transport = load_mgmt_transport(config);
+            let client = ManagementClient::new(transport);
+            match client.clients().await {
+                Ok(clients) => println!("{}", format_clients(&clients)),
+                Err(e) => {
+                    eprintln!("clients: {}", e);
+                    std::process::exit(1);
+                }
+            }
+        }
     }
+}
+
+fn format_upstreams(upstreams: &[UpstreamSnapshot]) -> String {
+    if upstreams.is_empty() {
+        return "no upstreams configured".into();
+    }
+    let mut lines = vec![format!(
+        "{:20} {:>10} {:>10} {:>10} {:>12} {:>12}",
+        "name", "successes", "failures", "timeouts", "last_lat_ms", "avg_lat_ms"
+    )];
+    for u in upstreams {
+        lines.push(format!(
+            "{:20} {:>10} {:>10} {:>10} {:>12} {:>12}",
+            u.name,
+            u.success_count,
+            u.failure_count,
+            u.timeout_count,
+            u.last_success_latency_ms
+                .map(|v| v.to_string())
+                .unwrap_or_else(|| "-".into()),
+            u.avg_success_latency_ms
+                .map(|v| v.to_string())
+                .unwrap_or_else(|| "-".into()),
+        ));
+    }
+    lines.join("\n")
+}
+
+fn format_activity(snap: &crate::metrics::MetricsSnapshot) -> String {
+    format!(
+        "uptime: {}\n\
+         total queries: {}\n\
+         accepted connections: {}\n\
+         active connections: {}\n\
+         pending leaders: {}\n\
+         pending followers: {}\n\
+         pending follower timeouts: {}\n\
+         pending follower successes: {}",
+        crate::metrics::format_uptime(snap.uptime_secs),
+        snap.total_queries,
+        snap.accepted_connections,
+        snap.active_connections,
+        snap.pending_leaders,
+        snap.pending_followers,
+        snap.pending_follower_timeouts,
+        snap.pending_follower_successes,
+    )
+}
+
+fn format_clients(clients: &[ClientSnapshot]) -> String {
+    if clients.is_empty() {
+        return "no clients tracked".into();
+    }
+    let mut lines = vec![format!(
+        "{:20} {:>12} {:>10} {:>10} {:>10} {:>10}",
+        "ip", "queries", "blocked", "cache_hits", "cache_misses", "active_conn"
+    )];
+    for c in clients {
+        lines.push(format!(
+            "{:20} {:>12} {:>10} {:>10} {:>10} {:>10}",
+            c.ip,
+            c.total_queries,
+            c.blocked_queries,
+            c.cache_hits,
+            c.cache_misses,
+            c.active_connections,
+        ));
+    }
+    lines.join("\n")
 }
 
 fn init_logging(cfg: &Config) {
@@ -183,27 +309,37 @@ async fn run_serve(cfg: Config) {
             }
         });
     }
-    let pool =
-        match upstream::pool_from_config(&cfg.upstreams, &cfg.bootstrap.dns, Some(metrics.clone()))
-        {
-            Ok(p) => p,
-            Err(e) => {
-                eprintln!("failed to build upstream pool: {}", e);
-                std::process::exit(1);
-            }
-        };
+    let upstream_names: Vec<String> = cfg.upstreams.iter().map(|e| e.name.clone()).collect();
+    let observability = Arc::new(crate::observability::ObservabilityRegistry::with_upstreams(
+        &upstream_names,
+    ));
+
+    let pool = match upstream::pool_from_config(
+        &cfg.upstreams,
+        &cfg.bootstrap.dns,
+        Some(metrics.clone()),
+        Some(observability.clone()),
+    ) {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("failed to build upstream pool: {}", e);
+            std::process::exit(1);
+        }
+    };
     let server = Server::new(
         cfg.clone(),
         metrics.clone(),
         cache.clone(),
         blocklist.clone(),
         pool.clone(),
+        Some(observability.clone()),
     );
     let mgmt_server = ManagementServer::new(
         cfg.management.clone(),
         metrics.clone(),
         cache.clone(),
         blocklist.clone(),
+        Some(observability.clone()),
     );
     let doh_server = cfg.doh.as_ref().map(|_| {
         let doh_state = doh::DohState {
@@ -214,6 +350,7 @@ async fn run_serve(cfg: Config) {
             pending: server::PendingQueries::new(metrics.clone()),
             edns: cfg.edns.clone(),
             blocklist_config: cfg.blocklist.clone(),
+            observability: Some(observability.clone()),
         };
         match doh::DohServer::new(&cfg, doh_state) {
             Ok(s) => s,

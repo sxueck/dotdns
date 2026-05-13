@@ -59,7 +59,6 @@ impl Config {
         Ok(cfg)
     }
 
-    // TODO: this got a bit long, maybe split up later
     pub fn validate(&self) -> Result<(), ConfigError> {
         if self.upstreams.is_empty() {
             return Err(ConfigError::NoUpstreams);

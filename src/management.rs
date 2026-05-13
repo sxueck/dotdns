@@ -4,6 +4,7 @@ use crate::blocklist::ReloadableBlocklist;
 use crate::cache::Cache;
 use crate::config::{ManagementConfig, ManagementTransport};
 use crate::metrics::{MetricsRecorder, MetricsSnapshot};
+use crate::observability::{ClientSnapshot, ObservabilityRegistry, UpstreamSnapshot};
 use serde::{Deserialize, Serialize};
 use std::path::Path;
 use std::sync::Arc;
@@ -16,6 +17,11 @@ pub enum ManagementRequest {
     Status,
     CacheFlush,
     BlocklistReload,
+    Tracking,
+    Sources,
+    Sourcestats,
+    Activity,
+    Clients,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -25,6 +31,10 @@ pub struct ManagementResponse {
     pub metrics: Option<MetricsSnapshot>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub message: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub upstreams: Option<Vec<UpstreamSnapshot>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub clients: Option<Vec<ClientSnapshot>>,
 }
 
 impl ManagementResponse {
@@ -33,6 +43,8 @@ impl ManagementResponse {
             status: "ok".into(),
             metrics: None,
             message: None,
+            upstreams: None,
+            clients: None,
         }
     }
 
@@ -41,6 +53,28 @@ impl ManagementResponse {
             status: "ok".into(),
             metrics: Some(metrics),
             message: None,
+            upstreams: None,
+            clients: None,
+        }
+    }
+
+    pub fn ok_with_upstreams(upstreams: Vec<UpstreamSnapshot>) -> Self {
+        Self {
+            status: "ok".into(),
+            metrics: None,
+            message: None,
+            upstreams: Some(upstreams),
+            clients: None,
+        }
+    }
+
+    pub fn ok_with_clients(clients: Vec<ClientSnapshot>) -> Self {
+        Self {
+            status: "ok".into(),
+            metrics: None,
+            message: None,
+            upstreams: None,
+            clients: Some(clients),
         }
     }
 
@@ -49,6 +83,8 @@ impl ManagementResponse {
             status: "error".into(),
             metrics: None,
             message: Some(msg.into()),
+            upstreams: None,
+            clients: None,
         }
     }
 }
@@ -59,6 +95,7 @@ pub struct ManagementServer {
     metrics: Arc<MetricsRecorder>,
     cache: Arc<Cache>,
     blocklist: Arc<ReloadableBlocklist>,
+    observability: Option<Arc<ObservabilityRegistry>>,
 }
 
 impl ManagementServer {
@@ -67,12 +104,14 @@ impl ManagementServer {
         metrics: Arc<MetricsRecorder>,
         cache: Arc<Cache>,
         blocklist: Arc<ReloadableBlocklist>,
+        observability: Option<Arc<ObservabilityRegistry>>,
     ) -> Self {
         Self {
             transport: config.transport,
             metrics,
             cache,
             blocklist,
+            observability,
         }
     }
 
@@ -131,8 +170,11 @@ impl ManagementServer {
             let metrics = self.metrics.clone();
             let cache = self.cache.clone();
             let blocklist = self.blocklist.clone();
+            let observability = self.observability.clone();
             tokio::spawn(async move {
-                if let Err(e) = handle_connection(stream, metrics, cache, blocklist).await {
+                if let Err(e) =
+                    handle_connection(stream, metrics, cache, blocklist, observability).await
+                {
                     tracing::debug!(error = %e, "management connection closed");
                 }
             });
@@ -154,8 +196,11 @@ impl ManagementServer {
             let metrics = self.metrics.clone();
             let cache = self.cache.clone();
             let blocklist = self.blocklist.clone();
+            let observability = self.observability.clone();
             tokio::spawn(async move {
-                if let Err(e) = handle_connection(stream, metrics, cache, blocklist).await {
+                if let Err(e) =
+                    handle_connection(stream, metrics, cache, blocklist, observability).await
+                {
                     tracing::debug!(error = %e, "management connection closed");
                 }
             });
@@ -168,6 +213,7 @@ async fn handle_connection<S>(
     metrics: Arc<MetricsRecorder>,
     cache: Arc<Cache>,
     blocklist: Arc<ReloadableBlocklist>,
+    observability: Option<Arc<ObservabilityRegistry>>,
 ) -> Result<(), ManagementError>
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
@@ -193,7 +239,8 @@ where
                         continue;
                     }
                 };
-                let resp = dispatch(req, &metrics, &cache, &blocklist).await;
+                let resp =
+                    dispatch(req, &metrics, &cache, &blocklist, observability.as_ref()).await;
                 send_response(&mut writer, &resp).await?;
             }
             Err(e) => return Err(ManagementError::Connection(e.to_string())),
@@ -227,6 +274,7 @@ async fn dispatch(
     metrics: &MetricsRecorder,
     cache: &Cache,
     blocklist: &ReloadableBlocklist,
+    observability: Option<&Arc<ObservabilityRegistry>>,
 ) -> ManagementResponse {
     match req {
         ManagementRequest::Status => ManagementResponse::ok_with_metrics(metrics.snapshot()),
@@ -237,6 +285,16 @@ async fn dispatch(
         ManagementRequest::BlocklistReload => match blocklist.refresh_and_reload().await {
             Ok(_) => ManagementResponse::ok(),
             Err(e) => ManagementResponse::error(format!("reload failed: {e}")),
+        },
+        ManagementRequest::Tracking => ManagementResponse::ok_with_metrics(metrics.snapshot()),
+        ManagementRequest::Sources | ManagementRequest::Sourcestats => match observability {
+            Some(reg) => ManagementResponse::ok_with_upstreams(reg.upstream_snapshot()),
+            None => ManagementResponse::error("observability not available"),
+        },
+        ManagementRequest::Activity => ManagementResponse::ok_with_metrics(metrics.snapshot()),
+        ManagementRequest::Clients => match observability {
+            Some(reg) => ManagementResponse::ok_with_clients(reg.client_snapshot()),
+            None => ManagementResponse::error("observability not available"),
         },
     }
 }
@@ -276,6 +334,52 @@ impl ManagementClient {
             return Err(ManagementError::Request(resp.message.unwrap_or_default()));
         }
         Ok(())
+    }
+
+    pub async fn tracking(&self) -> Result<MetricsSnapshot, ManagementError> {
+        let resp = self.send_request(ManagementRequest::Tracking).await?;
+        if resp.status != "ok" {
+            return Err(ManagementError::Request(resp.message.unwrap_or_default()));
+        }
+        resp.metrics
+            .ok_or_else(|| ManagementError::Request("missing metrics in tracking response".into()))
+    }
+
+    pub async fn sources(&self) -> Result<Vec<UpstreamSnapshot>, ManagementError> {
+        let resp = self.send_request(ManagementRequest::Sources).await?;
+        if resp.status != "ok" {
+            return Err(ManagementError::Request(resp.message.unwrap_or_default()));
+        }
+        resp.upstreams
+            .ok_or_else(|| ManagementError::Request("missing upstreams in sources response".into()))
+    }
+
+    pub async fn sourcestats(&self) -> Result<Vec<UpstreamSnapshot>, ManagementError> {
+        let resp = self.send_request(ManagementRequest::Sourcestats).await?;
+        if resp.status != "ok" {
+            return Err(ManagementError::Request(resp.message.unwrap_or_default()));
+        }
+        resp.upstreams.ok_or_else(|| {
+            ManagementError::Request("missing upstreams in sourcestats response".into())
+        })
+    }
+
+    pub async fn activity(&self) -> Result<MetricsSnapshot, ManagementError> {
+        let resp = self.send_request(ManagementRequest::Activity).await?;
+        if resp.status != "ok" {
+            return Err(ManagementError::Request(resp.message.unwrap_or_default()));
+        }
+        resp.metrics
+            .ok_or_else(|| ManagementError::Request("missing metrics in activity response".into()))
+    }
+
+    pub async fn clients(&self) -> Result<Vec<ClientSnapshot>, ManagementError> {
+        let resp = self.send_request(ManagementRequest::Clients).await?;
+        if resp.status != "ok" {
+            return Err(ManagementError::Request(resp.message.unwrap_or_default()));
+        }
+        resp.clients
+            .ok_or_else(|| ManagementError::Request("missing clients in clients response".into()))
     }
 
     async fn send_request(
@@ -361,6 +465,7 @@ mod tests {
     use crate::cache::Cache;
     use crate::config::CacheConfig;
     use crate::metrics::MetricsRecorder;
+    use crate::observability::ObservabilityRegistry;
     use std::io::Write;
     use std::sync::Arc;
     use std::time::Duration;
@@ -413,9 +518,10 @@ mod tests {
             metrics.clone(),
             cache.clone(),
             blocklist.clone(),
+            None,
         );
 
-        let _srv_handle = tokio::spawn(async move {
+        tokio::spawn(async move {
             let _ = server.run().await;
         });
 
@@ -440,12 +546,13 @@ mod tests {
             ManagementConfig {
                 transport: transport.clone(),
             },
-            metrics,
-            cache,
-            blocklist,
+            metrics.clone(),
+            cache.clone(),
+            blocklist.clone(),
+            None,
         );
 
-        let _srv_handle = tokio::spawn(async move {
+        tokio::spawn(async move {
             let _ = server.run().await;
         });
 
@@ -473,9 +580,10 @@ mod tests {
             metrics.clone(),
             cache.clone(),
             blocklist.clone(),
+            None,
         );
 
-        let _srv_handle = tokio::spawn(async move {
+        tokio::spawn(async move {
             let _ = server.run().await;
         });
 
@@ -513,9 +621,10 @@ mod tests {
             metrics.clone(),
             cache.clone(),
             blocklist.clone(),
+            None,
         );
 
-        let _srv_handle = tokio::spawn(async move {
+        tokio::spawn(async move {
             let _ = server.run().await;
         });
 
@@ -549,9 +658,10 @@ mod tests {
             metrics.clone(),
             cache.clone(),
             blocklist.clone(),
+            None,
         );
 
-        let _srv_handle = tokio::spawn(async move {
+        tokio::spawn(async move {
             let _ = server.run().await;
         });
 
@@ -565,5 +675,183 @@ mod tests {
         let resp: ManagementResponse = serde_json::from_str(line.trim()).unwrap();
         assert_eq!(resp.status, "error");
         assert!(resp.message.unwrap().contains("invalid request"));
+    }
+
+    #[tokio::test]
+    async fn tracking_roundtrip_over_unix_socket() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("mgmt.sock");
+        let transport = ManagementTransport::Unix { path: path.clone() };
+
+        let metrics = Arc::new(MetricsRecorder::new());
+        metrics.record_query();
+        let cache = Arc::new(Cache::new(CacheConfig::default(), metrics.clone()));
+        let blocklist = Arc::new(ReloadableBlocklist::new(vec![]));
+
+        let server = ManagementServer::new(
+            ManagementConfig {
+                transport: transport.clone(),
+            },
+            metrics.clone(),
+            cache.clone(),
+            blocklist.clone(),
+            None,
+        );
+
+        tokio::spawn(async move {
+            let _ = server.run().await;
+        });
+
+        drop(wait_for_unix_socket(&path).await);
+
+        let client = ManagementClient::new(transport);
+        let snap = client.tracking().await.expect("tracking should succeed");
+        assert_eq!(snap.total_queries, 1);
+    }
+
+    #[tokio::test]
+    async fn sources_and_sourcestats_roundtrip_over_unix_socket() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("mgmt.sock");
+        let transport = ManagementTransport::Unix { path: path.clone() };
+
+        let metrics = Arc::new(MetricsRecorder::new());
+        let cache = Arc::new(Cache::new(CacheConfig::default(), metrics.clone()));
+        let blocklist = Arc::new(ReloadableBlocklist::new(vec![]));
+        let observability = Arc::new(ObservabilityRegistry::with_upstreams(&[
+            "u1".into(),
+            "u2".into(),
+        ]));
+        observability.record_upstream_success("u1", 42);
+
+        let server = ManagementServer::new(
+            ManagementConfig {
+                transport: transport.clone(),
+            },
+            metrics.clone(),
+            cache.clone(),
+            blocklist.clone(),
+            Some(observability),
+        );
+
+        tokio::spawn(async move {
+            let _ = server.run().await;
+        });
+
+        drop(wait_for_unix_socket(&path).await);
+
+        let client = ManagementClient::new(transport.clone());
+        let sources = client.sources().await.expect("sources should succeed");
+        assert_eq!(sources.len(), 2);
+        let u1 = sources.iter().find(|u| u.name == "u1").unwrap();
+        assert_eq!(u1.success_count, 1);
+        assert_eq!(u1.last_success_latency_ms, Some(42));
+
+        let sourcestats = client
+            .sourcestats()
+            .await
+            .expect("sourcestats should succeed");
+        assert_eq!(sourcestats.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn activity_roundtrip_over_unix_socket() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("mgmt.sock");
+        let transport = ManagementTransport::Unix { path: path.clone() };
+
+        let metrics = Arc::new(MetricsRecorder::new());
+        metrics.record_accepted_connection();
+        let cache = Arc::new(Cache::new(CacheConfig::default(), metrics.clone()));
+        let blocklist = Arc::new(ReloadableBlocklist::new(vec![]));
+
+        let server = ManagementServer::new(
+            ManagementConfig {
+                transport: transport.clone(),
+            },
+            metrics.clone(),
+            cache.clone(),
+            blocklist.clone(),
+            None,
+        );
+
+        tokio::spawn(async move {
+            let _ = server.run().await;
+        });
+
+        drop(wait_for_unix_socket(&path).await);
+
+        let client = ManagementClient::new(transport);
+        let snap = client.activity().await.expect("activity should succeed");
+        assert_eq!(snap.accepted_connections, 1);
+    }
+
+    #[tokio::test]
+    async fn clients_roundtrip_over_unix_socket() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("mgmt.sock");
+        let transport = ManagementTransport::Unix { path: path.clone() };
+
+        let metrics = Arc::new(MetricsRecorder::new());
+        let cache = Arc::new(Cache::new(CacheConfig::default(), metrics.clone()));
+        let blocklist = Arc::new(ReloadableBlocklist::new(vec![]));
+        let observability = Arc::new(ObservabilityRegistry::with_capacity(100));
+        let ip = std::net::IpAddr::V4(std::net::Ipv4Addr::new(192, 168, 1, 1));
+        observability.record_client_query(ip);
+        observability.record_client_cache_hit(ip);
+
+        let server = ManagementServer::new(
+            ManagementConfig {
+                transport: transport.clone(),
+            },
+            metrics.clone(),
+            cache.clone(),
+            blocklist.clone(),
+            Some(observability),
+        );
+
+        tokio::spawn(async move {
+            let _ = server.run().await;
+        });
+
+        drop(wait_for_unix_socket(&path).await);
+
+        let client = ManagementClient::new(transport);
+        let clients = client.clients().await.expect("clients should succeed");
+        assert_eq!(clients.len(), 1);
+        assert_eq!(clients[0].ip, ip);
+        assert_eq!(clients[0].total_queries, 1);
+        assert_eq!(clients[0].cache_hits, 1);
+    }
+
+    #[tokio::test]
+    async fn observability_commands_error_when_registry_missing() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("mgmt.sock");
+        let transport = ManagementTransport::Unix { path: path.clone() };
+
+        let metrics = Arc::new(MetricsRecorder::new());
+        let cache = Arc::new(Cache::new(CacheConfig::default(), metrics.clone()));
+        let blocklist = Arc::new(ReloadableBlocklist::new(vec![]));
+
+        let server = ManagementServer::new(
+            ManagementConfig {
+                transport: transport.clone(),
+            },
+            metrics.clone(),
+            cache.clone(),
+            blocklist.clone(),
+            None,
+        );
+
+        tokio::spawn(async move {
+            let _ = server.run().await;
+        });
+
+        drop(wait_for_unix_socket(&path).await);
+
+        let client = ManagementClient::new(transport);
+        let err = client.sources().await.unwrap_err();
+        assert!(err.to_string().contains("observability not available"));
     }
 }

@@ -29,6 +29,36 @@ pub enum Commands {
     /// Blocklist operations.
     #[command(subcommand)]
     Blocklist(BlocklistCommands),
+    /// Show global tracking summary (uptime, queries, cache).
+    Tracking {
+        /// Path to the configuration file (optional; uses default socket if omitted).
+        #[arg(long, short = 'c')]
+        config: Option<PathBuf>,
+    },
+    /// List configured upstream sources.
+    Sources {
+        /// Path to the configuration file (optional; uses default socket if omitted).
+        #[arg(long, short = 'c')]
+        config: Option<PathBuf>,
+    },
+    /// Show per-source statistics.
+    Sourcestats {
+        /// Path to the configuration file (optional; uses default socket if omitted).
+        #[arg(long, short = 'c')]
+        config: Option<PathBuf>,
+    },
+    /// Show current activity (connections, queries, pending).
+    Activity {
+        /// Path to the configuration file (optional; uses default socket if omitted).
+        #[arg(long, short = 'c')]
+        config: Option<PathBuf>,
+    },
+    /// Show per-client DNS statistics.
+    Clients {
+        /// Path to the configuration file (optional; uses default socket if omitted).
+        #[arg(long, short = 'c')]
+        config: Option<PathBuf>,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -78,6 +108,16 @@ mod tests {
             vec!["dotdns", "cache", "flush", "--config", "dotdns.toml"],
             vec!["dotdns", "blocklist", "reload"],
             vec!["dotdns", "blocklist", "reload", "--config", "dotdns.toml"],
+            vec!["dotdns", "tracking"],
+            vec!["dotdns", "tracking", "--config", "dotdns.toml"],
+            vec!["dotdns", "sources"],
+            vec!["dotdns", "sources", "--config", "dotdns.toml"],
+            vec!["dotdns", "sourcestats"],
+            vec!["dotdns", "sourcestats", "--config", "dotdns.toml"],
+            vec!["dotdns", "activity"],
+            vec!["dotdns", "activity", "--config", "dotdns.toml"],
+            vec!["dotdns", "clients"],
+            vec!["dotdns", "clients", "--config", "dotdns.toml"],
         ];
 
         for args in cases {
