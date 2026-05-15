@@ -912,7 +912,14 @@ mod tests {
             tls_cert_path: None,
             timeout: Duration::from_secs(5),
         };
-        let pool = pool_from_config(&[entry], &[], None, None).unwrap();
+        let pool = pool_from_config(
+            &[entry],
+            &[],
+            None,
+            None,
+            crate::config::UpstreamSelectionPolicy::Sequential,
+        )
+        .unwrap();
 
         let query = test_query("blocked.com.", RecordType::A);
         let resp = resolve(query, &metrics, &cache, &blocklist, &pool).await;
@@ -932,7 +939,12 @@ mod tests {
         let blocklist = Arc::new(ReloadableBlocklist::from_engine(engine, vec![]));
         let metrics = Arc::new(MetricsRecorder::new());
         let cache = Arc::new(Cache::new(CacheConfig::default(), metrics.clone()));
-        let pool = UpstreamPool::new(vec![], None, None);
+        let pool = UpstreamPool::new(
+            vec![],
+            None,
+            None,
+            crate::config::UpstreamSelectionPolicy::Sequential,
+        );
 
         let query = test_query("blocked.com.", RecordType::A);
         let resp = resolve(query, &metrics, &cache, &blocklist, &pool).await;
@@ -949,7 +961,12 @@ mod tests {
         let blocklist = Arc::new(ReloadableBlocklist::from_engine(engine, vec![]));
         let metrics = Arc::new(MetricsRecorder::new());
         let cache = Arc::new(Cache::new(CacheConfig::default(), metrics.clone()));
-        let pool = UpstreamPool::new(vec![], None, None);
+        let pool = UpstreamPool::new(
+            vec![],
+            None,
+            None,
+            crate::config::UpstreamSelectionPolicy::Sequential,
+        );
 
         let query = test_query("blocked.com.", RecordType::AAAA);
         let resp = resolve(query, &metrics, &cache, &blocklist, &pool).await;
@@ -968,7 +985,12 @@ mod tests {
         let blocklist = Arc::new(ReloadableBlocklist::from_engine(engine, vec![]));
         let metrics = Arc::new(MetricsRecorder::new());
         let cache = Arc::new(Cache::new(CacheConfig::default(), metrics.clone()));
-        let pool = UpstreamPool::new(vec![], None, None);
+        let pool = UpstreamPool::new(
+            vec![],
+            None,
+            None,
+            crate::config::UpstreamSelectionPolicy::Sequential,
+        );
 
         let query = test_query("blocked.com.", RecordType::MX);
         let resp = resolve(query, &metrics, &cache, &blocklist, &pool).await;
@@ -985,7 +1007,12 @@ mod tests {
         let blocklist = Arc::new(ReloadableBlocklist::from_engine(engine, vec![]));
         let metrics = Arc::new(MetricsRecorder::new());
         let cache = Arc::new(Cache::new(CacheConfig::default(), metrics.clone()));
-        let pool = UpstreamPool::new(vec![], None, None);
+        let pool = UpstreamPool::new(
+            vec![],
+            None,
+            None,
+            crate::config::UpstreamSelectionPolicy::Sequential,
+        );
 
         let mut query1 = test_query("blocked.com.", RecordType::A);
         query1.set_id(1001);
@@ -1013,7 +1040,12 @@ mod tests {
         let blocklist = Arc::new(ReloadableBlocklist::from_engine(engine, vec![]));
         let metrics = Arc::new(MetricsRecorder::new());
         let cache = Arc::new(Cache::new(CacheConfig::default(), metrics.clone()));
-        let pool = UpstreamPool::new(vec![], None, None);
+        let pool = UpstreamPool::new(
+            vec![],
+            None,
+            None,
+            crate::config::UpstreamSelectionPolicy::Sequential,
+        );
         let pending = PendingQueries::new(metrics.clone());
         let edns = EdnsConfig::default();
         let blocklist_config = BlocklistConfig {
@@ -1060,7 +1092,12 @@ mod tests {
         let blocklist = Arc::new(ReloadableBlocklist::from_engine(engine, vec![]));
         let metrics = Arc::new(MetricsRecorder::new());
         let cache = Arc::new(Cache::new(CacheConfig::default(), metrics.clone()));
-        let pool = UpstreamPool::new(vec![], None, None);
+        let pool = UpstreamPool::new(
+            vec![],
+            None,
+            None,
+            crate::config::UpstreamSelectionPolicy::Sequential,
+        );
         let pending = PendingQueries::new(metrics.clone());
         let edns = ecs_config();
         let blocklist_config = BlocklistConfig::default();
@@ -1154,7 +1191,14 @@ mod tests {
             tls_cert_path: None,
             timeout: Duration::from_secs(5),
         };
-        let pool = pool_from_config(&[entry], &[], None, None).unwrap();
+        let pool = pool_from_config(
+            &[entry],
+            &[],
+            None,
+            None,
+            crate::config::UpstreamSelectionPolicy::Sequential,
+        )
+        .unwrap();
         let metrics = Arc::new(MetricsRecorder::new());
         let pending = PendingQueries::new(metrics);
         let mut query1 = test_query("example.com.", RecordType::A);
@@ -1190,7 +1234,14 @@ mod tests {
             tls_cert_path: None,
             timeout: Duration::from_secs(5),
         };
-        let pool = pool_from_config(&[entry], &[], None, None).unwrap();
+        let pool = pool_from_config(
+            &[entry],
+            &[],
+            None,
+            None,
+            crate::config::UpstreamSelectionPolicy::Sequential,
+        )
+        .unwrap();
         let pending_for_task = pending.clone();
         let task = tokio::spawn(async move { pending_for_task.query(&pool, &query).await });
 
@@ -1219,7 +1270,14 @@ mod tests {
         let metrics = Arc::new(MetricsRecorder::new());
         let cache = Arc::new(Cache::new(CacheConfig::default(), metrics.clone()));
         let blocklist = Arc::new(ReloadableBlocklist::new(vec![]));
-        let pool = pool_from_config(&[entry], &[], None, None).unwrap();
+        let pool = pool_from_config(
+            &[entry],
+            &[],
+            None,
+            None,
+            crate::config::UpstreamSelectionPolicy::Sequential,
+        )
+        .unwrap();
         let pending = PendingQueries::new(metrics.clone());
         let edns = EdnsConfig::default();
         let blocklist_config = BlocklistConfig::default();
@@ -1264,7 +1322,14 @@ mod tests {
         let metrics = Arc::new(MetricsRecorder::new());
         let cache = Arc::new(Cache::new(CacheConfig::default(), metrics.clone()));
         let blocklist = Arc::new(ReloadableBlocklist::new(vec![]));
-        let pool = pool_from_config(&[entry], &[], None, None).unwrap();
+        let pool = pool_from_config(
+            &[entry],
+            &[],
+            None,
+            None,
+            crate::config::UpstreamSelectionPolicy::Sequential,
+        )
+        .unwrap();
 
         let query = test_query("example.com.", RecordType::A);
         let resp1 = resolve(query.clone(), &metrics, &cache, &blocklist, &pool).await;
@@ -1293,7 +1358,14 @@ mod tests {
         let metrics = Arc::new(MetricsRecorder::new());
         let cache = Arc::new(Cache::new(CacheConfig::default(), metrics.clone()));
         let blocklist = Arc::new(ReloadableBlocklist::new(vec![]));
-        let pool = pool_from_config(&[entry], &[], None, None).unwrap();
+        let pool = pool_from_config(
+            &[entry],
+            &[],
+            None,
+            None,
+            crate::config::UpstreamSelectionPolicy::Sequential,
+        )
+        .unwrap();
 
         let query = test_query_with_edns("example.com.", RecordType::A);
         let resp = resolve(query.clone(), &metrics, &cache, &blocklist, &pool).await;

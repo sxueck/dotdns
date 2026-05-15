@@ -12,7 +12,7 @@ mod upstream;
 use crate::blocklist::ReloadableBlocklist;
 use crate::cache::Cache;
 use crate::cli::{BlocklistCommands, CacheCommands, Cli, Commands};
-use crate::config::{Config, ManagementTransport};
+use crate::config::{Config, ManagementTransport, UpstreamSelectionPolicy};
 use crate::management::{ManagementClient, ManagementServer};
 use crate::metrics::{load_stats, save_stats, MetricsRecorder};
 use crate::observability::{ClientSnapshot, UpstreamSnapshot};
@@ -107,10 +107,12 @@ async fn main() {
             }
         }
         Commands::Sources { config } => {
-            let transport = load_mgmt_transport(config);
+            let (transport, policy) = load_mgmt_connection(config);
             let client = ManagementClient::new(transport);
             match client.sources().await {
-                Ok(upstreams) => println!("{}", format_upstreams(&upstreams)),
+                Ok(upstreams) => {
+                    println!("{}", format_upstreams(&upstreams, policy.as_ref()));
+                }
                 Err(e) => {
                     eprintln!("sources: {}", e);
                     std::process::exit(1);
@@ -118,10 +120,12 @@ async fn main() {
             }
         }
         Commands::Sourcestats { config } => {
-            let transport = load_mgmt_transport(config);
+            let (transport, policy) = load_mgmt_connection(config);
             let client = ManagementClient::new(transport);
             match client.sourcestats().await {
-                Ok(upstreams) => println!("{}", format_upstreams(&upstreams)),
+                Ok(upstreams) => {
+                    println!("{}", format_upstreams(&upstreams, policy.as_ref()));
+                }
                 Err(e) => {
                     eprintln!("sourcestats: {}", e);
                     std::process::exit(1);
@@ -153,14 +157,21 @@ async fn main() {
     }
 }
 
-fn format_upstreams(upstreams: &[UpstreamSnapshot]) -> String {
+fn format_upstreams(
+    upstreams: &[UpstreamSnapshot],
+    selection_policy: Option<&UpstreamSelectionPolicy>,
+) -> String {
     if upstreams.is_empty() {
         return "no upstreams configured".into();
     }
-    let mut lines = vec![format!(
+    let mut lines = Vec::new();
+    if let Some(policy) = selection_policy {
+        lines.push(format!("selection policy: {}", policy));
+    }
+    lines.push(format!(
         "{:20} {:>10} {:>10} {:>10} {:>12} {:>12}",
         "name", "successes", "failures", "timeouts", "last_lat_ms", "avg_lat_ms"
-    )];
+    ));
     for u in upstreams {
         lines.push(format!(
             "{:20} {:>10} {:>10} {:>10} {:>12} {:>12}",
@@ -247,6 +258,21 @@ fn init_logging(cfg: &Config) {
 }
 
 fn load_mgmt_transport(config: Option<PathBuf>) -> ManagementTransport {
+    load_mgmt_config(config)
+        .map(|cfg| cfg.management.transport)
+        .unwrap_or_default()
+}
+
+fn load_mgmt_connection(
+    config: Option<PathBuf>,
+) -> (ManagementTransport, Option<UpstreamSelectionPolicy>) {
+    let cfg = load_mgmt_config(config);
+    let policy = cfg.as_ref().map(|c| c.upstream_selection_policy);
+    let transport = cfg.map(|c| c.management.transport).unwrap_or_default();
+    (transport, policy)
+}
+
+fn load_mgmt_config(config: Option<PathBuf>) -> Option<Config> {
     match config.or_else(default_config_path) {
         Some(path) => {
             let source = fs::read_to_string(&path).unwrap_or_else(|e| {
@@ -257,9 +283,9 @@ fn load_mgmt_transport(config: Option<PathBuf>) -> ManagementTransport {
                 eprintln!("config error: {}", e);
                 std::process::exit(1);
             });
-            cfg.management.transport
+            Some(cfg)
         }
-        None => ManagementTransport::default(),
+        None => None,
     }
 }
 
@@ -319,6 +345,7 @@ async fn run_serve(cfg: Config) {
         &cfg.bootstrap.dns,
         Some(metrics.clone()),
         Some(observability.clone()),
+        cfg.upstream_selection_policy,
     ) {
         Ok(p) => p,
         Err(e) => {

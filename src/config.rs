@@ -32,6 +32,8 @@ pub struct Config {
     #[serde(default)]
     pub upstreams: Vec<UpstreamEntry>,
     #[serde(default)]
+    pub upstream_selection_policy: UpstreamSelectionPolicy,
+    #[serde(default)]
     pub bootstrap: BootstrapConfig,
     #[serde(default)]
     pub cache: CacheConfig,
@@ -234,6 +236,23 @@ impl fmt::Display for UpstreamProtocol {
             UpstreamProtocol::Plain => write!(f, "plain"),
             UpstreamProtocol::Tls => write!(f, "dot"),
             UpstreamProtocol::Https => write!(f, "doh"),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum UpstreamSelectionPolicy {
+    #[default]
+    Sequential,
+    RoundRobin,
+}
+
+impl fmt::Display for UpstreamSelectionPolicy {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            UpstreamSelectionPolicy::Sequential => write!(f, "sequential"),
+            UpstreamSelectionPolicy::RoundRobin => write!(f, "round_robin"),
         }
     }
 }
@@ -882,5 +901,76 @@ address = "1.1.1.1:53"
 "#;
         let err = Config::from_toml(source).unwrap_err();
         assert!(matches!(err, ConfigError::InvalidValue { field, .. } if field == "doh.binds"));
+    }
+
+    #[test]
+    fn default_selection_policy_is_sequential() {
+        let source = r#"
+[server]
+binds = ["0.0.0.0:853"]
+
+[[upstreams]]
+name = "cf"
+address = "1.1.1.1:53"
+"#;
+        let cfg = Config::from_toml(source).unwrap();
+        assert_eq!(
+            cfg.upstream_selection_policy,
+            UpstreamSelectionPolicy::Sequential
+        );
+    }
+
+    #[test]
+    fn parse_round_robin_selection_policy() {
+        let source = r#"
+upstream_selection_policy = "round_robin"
+
+[server]
+binds = ["0.0.0.0:853"]
+
+[[upstreams]]
+name = "cf"
+address = "1.1.1.1:53"
+"#;
+        let cfg = Config::from_toml(source).unwrap();
+        assert_eq!(
+            cfg.upstream_selection_policy,
+            UpstreamSelectionPolicy::RoundRobin
+        );
+    }
+
+    #[test]
+    fn parse_sequential_selection_policy() {
+        let source = r#"
+upstream_selection_policy = "sequential"
+
+[server]
+binds = ["0.0.0.0:853"]
+
+[[upstreams]]
+name = "cf"
+address = "1.1.1.1:53"
+"#;
+        let cfg = Config::from_toml(source).unwrap();
+        assert_eq!(
+            cfg.upstream_selection_policy,
+            UpstreamSelectionPolicy::Sequential
+        );
+    }
+
+    #[test]
+    fn reject_unknown_selection_policy() {
+        let source = r#"
+upstream_selection_policy = "random"
+
+[server]
+binds = ["0.0.0.0:853"]
+
+[[upstreams]]
+name = "cf"
+address = "1.1.1.1:53"
+"#;
+        let err = Config::from_toml(source).unwrap_err();
+        assert!(matches!(err, ConfigError::InvalidValue { .. }));
     }
 }

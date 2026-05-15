@@ -1,4 +1,4 @@
-use crate::config::{UpstreamEntry, UpstreamProtocol};
+use crate::config::{UpstreamEntry, UpstreamProtocol, UpstreamSelectionPolicy};
 use crate::metrics::MetricsRecorder;
 use crate::observability::ObservabilityRegistry;
 use hickory_proto::op::{Message, MessageType, OpCode, Query};
@@ -7,6 +7,7 @@ use hickory_proto::serialize::binary::{BinDecodable, BinEncodable};
 use std::error::Error;
 use std::net::{IpAddr, SocketAddr, ToSocketAddrs, UdpSocket as StdUdpSocket};
 use std::str::FromStr;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -519,6 +520,8 @@ pub struct UpstreamPool {
     upstreams: Vec<(Upstream, String)>,
     metrics: Option<Arc<MetricsRecorder>>,
     observability: Option<Arc<ObservabilityRegistry>>,
+    policy: UpstreamSelectionPolicy,
+    round_robin_next: Arc<AtomicUsize>,
 }
 
 impl UpstreamPool {
@@ -526,22 +529,38 @@ impl UpstreamPool {
         upstreams: Vec<(Upstream, String)>,
         metrics: Option<Arc<MetricsRecorder>>,
         observability: Option<Arc<ObservabilityRegistry>>,
+        policy: UpstreamSelectionPolicy,
     ) -> Self {
         Self {
             upstreams,
             metrics,
             observability,
+            policy,
+            round_robin_next: Arc::new(AtomicUsize::new(0)),
         }
     }
 
     pub async fn query(&self, message: &Message) -> Result<Message, UpstreamError> {
-        let mut last_err = None;
+        let len = self.upstreams.len();
+        if len == 0 {
+            return Err(UpstreamError::AllFailed);
+        }
 
-        for (upstream, name) in &self.upstreams {
-            let start = std::time::Instant::now();
+        let start = match self.policy {
+            UpstreamSelectionPolicy::Sequential => 0,
+            UpstreamSelectionPolicy::RoundRobin => {
+                self.round_robin_next.fetch_add(1, Ordering::Relaxed) % len
+            }
+        };
+
+        let mut last_err = None;
+        for offset in 0..len {
+            let idx = (start + offset) % len;
+            let (upstream, name) = &self.upstreams[idx];
+            let start_time = std::time::Instant::now();
             match upstream.query(message).await {
                 Ok(response) => {
-                    let elapsed = start.elapsed().as_millis() as u64;
+                    let elapsed = start_time.elapsed().as_millis() as u64;
                     if let Some(m) = &self.metrics {
                         m.record_upstream_success();
                     }
@@ -579,13 +598,14 @@ pub fn pool_from_config(
     bootstrap_dns: &[SocketAddr],
     metrics: Option<Arc<MetricsRecorder>>,
     observability: Option<Arc<ObservabilityRegistry>>,
+    policy: UpstreamSelectionPolicy,
 ) -> Result<UpstreamPool, UpstreamError> {
     let mut upstreams = Vec::with_capacity(entries.len());
     for entry in entries {
         let upstream = Upstream::from_entry(entry, bootstrap_dns)?;
         upstreams.push((upstream, entry.name.clone()));
     }
-    Ok(UpstreamPool::new(upstreams, metrics, observability))
+    Ok(UpstreamPool::new(upstreams, metrics, observability, policy))
 }
 
 #[cfg(test)]
@@ -819,7 +839,14 @@ mod tests {
         let mut entry2 = entry2;
         entry2.address = ok_addr.to_string();
 
-        let pool = pool_from_config(&[entry1, entry2], &[], None, None).unwrap();
+        let pool = pool_from_config(
+            &[entry1, entry2],
+            &[],
+            None,
+            None,
+            UpstreamSelectionPolicy::Sequential,
+        )
+        .unwrap();
         let query = test_query();
 
         let response = pool.query(&query).await.unwrap();
@@ -836,7 +863,14 @@ mod tests {
             timeout: Duration::from_secs(5),
         };
 
-        let pool = pool_from_config(&[entry.clone(), entry], &[], None, None).unwrap();
+        let pool = pool_from_config(
+            &[entry.clone(), entry],
+            &[],
+            None,
+            None,
+            UpstreamSelectionPolicy::Sequential,
+        )
+        .unwrap();
         let query = test_query();
 
         let err = pool.query(&query).await.unwrap_err();
@@ -856,8 +890,14 @@ mod tests {
         };
 
         let metrics = Arc::new(MetricsRecorder::new());
-        let pool =
-            pool_from_config(&[entry.clone(), entry], &[], Some(metrics.clone()), None).unwrap();
+        let pool = pool_from_config(
+            &[entry.clone(), entry],
+            &[],
+            Some(metrics.clone()),
+            None,
+            UpstreamSelectionPolicy::Sequential,
+        )
+        .unwrap();
         let query = test_query();
 
         let _ = pool.query(&query).await;
@@ -886,7 +926,14 @@ mod tests {
         };
 
         let obs = Arc::new(ObservabilityRegistry::with_upstreams(&["fail".into()]));
-        let pool = pool_from_config(&[entry.clone(), entry], &[], None, Some(obs.clone())).unwrap();
+        let pool = pool_from_config(
+            &[entry.clone(), entry],
+            &[],
+            None,
+            Some(obs.clone()),
+            UpstreamSelectionPolicy::Sequential,
+        )
+        .unwrap();
         let query = test_query();
 
         let _ = pool.query(&query).await;
@@ -914,7 +961,14 @@ mod tests {
         entry.address = ok_addr.to_string();
 
         let obs = Arc::new(ObservabilityRegistry::with_upstreams(&["ok".into()]));
-        let pool = pool_from_config(&[entry], &[], None, Some(obs.clone())).unwrap();
+        let pool = pool_from_config(
+            &[entry],
+            &[],
+            None,
+            Some(obs.clone()),
+            UpstreamSelectionPolicy::Sequential,
+        )
+        .unwrap();
         let query = test_query();
 
         let response = pool.query(&query).await.unwrap();
@@ -928,5 +982,171 @@ mod tests {
         assert_eq!(u.failure_count, 0);
         assert!(u.last_success_latency_ms.is_some());
         assert!(u.avg_success_latency_ms.is_some());
+    }
+
+    #[tokio::test]
+    async fn round_robin_alternates_upstreams() {
+        let entry1 = UpstreamEntry {
+            name: "u1".into(),
+            address: "127.0.0.1:0".into(),
+            protocol: UpstreamProtocol::Plain,
+            tls_cert_path: None,
+            timeout: Duration::from_secs(5),
+        };
+        let entry2 = UpstreamEntry {
+            name: "u2".into(),
+            address: "127.0.0.1:0".into(),
+            protocol: UpstreamProtocol::Plain,
+            tls_cert_path: None,
+            timeout: Duration::from_secs(5),
+        };
+
+        let (_handle1, addr1) = start_mock_udp_server("127.0.0.1:0").await;
+        let (_handle2, addr2) = start_mock_udp_server("127.0.0.1:0").await;
+
+        let mut entry1 = entry1;
+        let mut entry2 = entry2;
+        entry1.address = addr1.to_string();
+        entry2.address = addr2.to_string();
+
+        let obs = Arc::new(ObservabilityRegistry::with_upstreams(&[
+            "u1".into(),
+            "u2".into(),
+        ]));
+        let pool = pool_from_config(
+            &[entry1, entry2],
+            &[],
+            None,
+            Some(obs.clone()),
+            UpstreamSelectionPolicy::RoundRobin,
+        )
+        .unwrap();
+        let query = test_query();
+
+        for _ in 0..4 {
+            let response = pool.query(&query).await.unwrap();
+            assert_eq!(response.message_type(), MessageType::Response);
+        }
+
+        let snap = obs.snapshot();
+        let u1 = snap.upstreams.iter().find(|u| u.name == "u1").unwrap();
+        let u2 = snap.upstreams.iter().find(|u| u.name == "u2").unwrap();
+        assert_eq!(u1.success_count, 2);
+        assert_eq!(u2.success_count, 2);
+    }
+
+    #[tokio::test]
+    async fn round_robin_fallback_on_failure() {
+        let entry1 = UpstreamEntry {
+            name: "fail".into(),
+            address: "127.0.0.1:1".into(),
+            protocol: UpstreamProtocol::Plain,
+            tls_cert_path: None,
+            timeout: Duration::from_secs(1),
+        };
+        let entry2 = UpstreamEntry {
+            name: "ok".into(),
+            address: "127.0.0.1:0".into(),
+            protocol: UpstreamProtocol::Plain,
+            tls_cert_path: None,
+            timeout: Duration::from_secs(5),
+        };
+
+        let (_handle, ok_addr) = start_mock_udp_server("127.0.0.1:0").await;
+        let mut entry2 = entry2;
+        entry2.address = ok_addr.to_string();
+
+        let obs = Arc::new(ObservabilityRegistry::with_upstreams(&[
+            "fail".into(),
+            "ok".into(),
+        ]));
+        let pool = pool_from_config(
+            &[entry1, entry2],
+            &[],
+            None,
+            Some(obs.clone()),
+            UpstreamSelectionPolicy::RoundRobin,
+        )
+        .unwrap();
+        let query = test_query();
+
+        // First query tries u1 (index 0), fails, falls back to u2
+        let response = pool.query(&query).await.unwrap();
+        assert_eq!(response.message_type(), MessageType::Response);
+
+        // Second query tries u2 (index 1), succeeds directly
+        let response = pool.query(&query).await.unwrap();
+        assert_eq!(response.message_type(), MessageType::Response);
+
+        let snap = obs.snapshot();
+        let u_fail = snap.upstreams.iter().find(|u| u.name == "fail").unwrap();
+        let u_ok = snap.upstreams.iter().find(|u| u.name == "ok").unwrap();
+        assert_eq!(u_fail.failure_count, 1);
+        assert_eq!(u_ok.success_count, 2);
+    }
+
+    #[tokio::test]
+    async fn round_robin_single_upstream() {
+        let entry = UpstreamEntry {
+            name: "only".into(),
+            address: "127.0.0.1:0".into(),
+            protocol: UpstreamProtocol::Plain,
+            tls_cert_path: None,
+            timeout: Duration::from_secs(5),
+        };
+
+        let (_handle, addr) = start_mock_udp_server("127.0.0.1:0").await;
+        let mut entry = entry;
+        entry.address = addr.to_string();
+
+        let obs = Arc::new(ObservabilityRegistry::with_upstreams(&["only".into()]));
+        let pool = pool_from_config(
+            &[entry],
+            &[],
+            None,
+            Some(obs.clone()),
+            UpstreamSelectionPolicy::RoundRobin,
+        )
+        .unwrap();
+        let query = test_query();
+
+        let response = pool.query(&query).await.unwrap();
+        assert_eq!(response.message_type(), MessageType::Response);
+
+        let snap = obs.snapshot();
+        assert_eq!(snap.upstreams[0].success_count, 1);
+    }
+
+    #[tokio::test]
+    async fn round_robin_all_failed() {
+        let entry = UpstreamEntry {
+            name: "fail".into(),
+            address: "127.0.0.1:1".into(),
+            protocol: UpstreamProtocol::Plain,
+            tls_cert_path: None,
+            timeout: Duration::from_secs(1),
+        };
+
+        let pool = pool_from_config(
+            &[entry.clone(), entry],
+            &[],
+            None,
+            None,
+            UpstreamSelectionPolicy::RoundRobin,
+        )
+        .unwrap();
+        let query = test_query();
+
+        let err = pool.query(&query).await.unwrap_err();
+        assert!(matches!(err, UpstreamError::Network(_)));
+    }
+
+    #[tokio::test]
+    async fn round_robin_empty_pool_returns_all_failed() {
+        let pool = UpstreamPool::new(vec![], None, None, UpstreamSelectionPolicy::RoundRobin);
+        let query = test_query();
+
+        let err = pool.query(&query).await.unwrap_err();
+        assert!(matches!(err, UpstreamError::AllFailed));
     }
 }
