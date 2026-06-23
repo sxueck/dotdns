@@ -21,7 +21,7 @@ See `examples/dotdns.toml` for a full configuration template.
 
 ## Configuration
 
-Upstreams are tried in order until one succeeds, so later entries act as fallback resolvers when earlier entries fail. Supported upstream protocols are:
+The default `sequential` selection policy tries upstreams in order until one succeeds, so later entries act as fallback resolvers. Set `upstream_selection_policy = "round_robin"` to distribute first-attempt queries evenly across upstreams; failures still fall back sequentially. Supported upstream protocols are:
 
 - ordinary DNS: `protocol = "plain"`
 - DNS-over-TLS: `protocol = "dot"`

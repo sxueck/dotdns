@@ -234,7 +234,7 @@ fn format_clients(clients: &[ClientSnapshot]) -> String {
 }
 
 fn init_logging(cfg: &Config) {
-    let filter = tracing_subscriber::EnvFilter::new(&cfg.logging.level);
+    let filter = build_log_filter(&cfg.logging.level);
     match cfg.logging.format {
         config::LogFormat::Pretty => {
             tracing_subscriber::fmt()
@@ -255,6 +255,25 @@ fn init_logging(cfg: &Config) {
                 .init();
         }
     }
+}
+
+/// Builds the log filter from the configured level and silences the noisy
+/// `rustls::msgs::handshake` WARN logs.
+///
+/// Public DoT clients routinely send an IP address as the TLS SNI, which
+/// RFC 6066 forbids. rustls 0.23 enforces this strictly and emits a WARN
+/// ("Illegal SNI extension") for every such ClientHello. The connection still
+/// succeeds, so the warning is pure noise that floods the logs. rustls parses
+/// (and warns about) the ClientHello internally during the handshake, so the
+/// only reliable place to suppress it is the log filter: we raise the level
+/// threshold for that specific module to ERROR, leaving all other logging
+/// untouched.
+fn build_log_filter(level: &str) -> tracing_subscriber::EnvFilter {
+    let mut filter = tracing_subscriber::EnvFilter::new(level);
+    if let Ok(directive) = "rustls::msgs::handshake=error".parse() {
+        filter = filter.add_directive(directive);
+    }
+    filter
 }
 
 fn load_mgmt_transport(config: Option<PathBuf>) -> ManagementTransport {
@@ -459,4 +478,72 @@ async fn wait_for_shutdown() {
 #[cfg(not(unix))]
 async fn wait_for_shutdown() {
     tokio::signal::ctrl_c().await.ok();
+}
+
+#[cfg(test)]
+mod logging_tests {
+    use super::build_log_filter;
+
+    #[test]
+    fn log_filter_silences_rustls_handshake_warnings() {
+        // The configured base level is preserved, and an extra directive raises
+        // the rustls handshake module to ERROR so the per-connection
+        // "Illegal SNI extension" WARN logs (from IP-as-SNI clients) are dropped.
+        let filter = build_log_filter("info");
+        let rendered = filter.to_string();
+        assert!(
+            rendered.contains("rustls::msgs::handshake"),
+            "filter should target the rustls handshake module: {rendered}"
+        );
+        assert!(
+            rendered.contains("info"),
+            "filter should keep the configured base level: {rendered}"
+        );
+    }
+
+    #[test]
+    fn log_filter_handles_complex_base_directives() {
+        // A non-trivial base spec must still parse and gain the suppression.
+        let filter = build_log_filter("warn,dotdns=debug");
+        let rendered = filter.to_string();
+        assert!(rendered.contains("rustls::msgs::handshake"));
+        assert!(rendered.contains("dotdns"));
+    }
+
+    #[test]
+    fn log_filter_drops_rustls_handshake_warn_but_keeps_others() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+        use tracing::Level;
+        use tracing_subscriber::layer::{Context, Layer};
+        use tracing_subscriber::prelude::*;
+
+        // Minimal layer that counts events that survive the filter.
+        struct CountingLayer(Arc<AtomicUsize>);
+        impl<S: tracing::Subscriber> Layer<S> for CountingLayer {
+            fn on_event(&self, _event: &tracing::Event<'_>, _ctx: Context<'_, S>) {
+                self.0.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+
+        let count = Arc::new(AtomicUsize::new(0));
+        let subscriber = tracing_subscriber::registry()
+            .with(build_log_filter("info"))
+            .with(CountingLayer(count.clone()));
+
+        tracing::subscriber::with_default(subscriber, || {
+            // The rustls log bridge forwards records to the same tracing target,
+            // so a WARN on this target must be filtered out...
+            tracing::event!(target: "rustls::msgs::handshake", Level::WARN, "Illegal SNI extension");
+            // ...while unrelated WARNs and that module's ERRORs still pass.
+            tracing::event!(target: "dotdns", Level::WARN, "real warning");
+            tracing::event!(target: "rustls::msgs::handshake", Level::ERROR, "real error");
+        });
+
+        assert_eq!(
+            count.load(Ordering::Relaxed),
+            2,
+            "exactly the rustls handshake WARN should be suppressed"
+        );
+    }
 }

@@ -14,6 +14,7 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::net::TcpListener;
+use tokio::sync::Semaphore;
 use tokio_rustls::TlsAcceptor;
 
 use crate::blocklist::ReloadableBlocklist;
@@ -67,12 +68,16 @@ impl DohServer {
         }
 
         let mut tasks = tokio::task::JoinSet::new();
+        let conn_limit = Arc::new(Semaphore::new(
+            crate::server::MAX_CONCURRENT_CONNECTIONS,
+        ));
         for listener in listeners {
             tasks.spawn(accept_loop(
                 listener,
                 acceptor.clone(),
                 self.state.clone(),
                 self.idle_timeout,
+                conn_limit.clone(),
             ));
         }
 
@@ -97,11 +102,18 @@ async fn accept_loop(
     acceptor: TlsAcceptor,
     state: DohState,
     idle_timeout: Duration,
+    conn_limit: Arc<Semaphore>,
 ) -> Result<(), crate::server::ServerError> {
     let app = router(state.clone());
 
     loop {
         let (stream, peer) = listener.accept().await?;
+        // Apply backpressure once the concurrency limit is reached; the permit is
+        // held for the lifetime of the connection task.
+        let permit = match conn_limit.clone().acquire_owned().await {
+            Ok(p) => p,
+            Err(_) => break Ok(()),
+        };
         let acceptor = acceptor.clone();
         let service = TowerToHyperService::new(app.clone().layer(Extension(ConnectInfo(peer))));
         let metrics = state.metrics.clone();
@@ -113,14 +125,28 @@ async fn accept_loop(
         }
 
         tokio::spawn(async move {
-            let tls_stream = match acceptor.accept(stream).await {
-                Ok(s) => {
+            let _permit = permit;
+            // Bound the TLS handshake so half-open connections cannot park a task
+            // (and its permit) indefinitely. header_read_timeout only applies
+            // after the handshake completes, so it does not cover this window.
+            let handshake = tokio::time::timeout(idle_timeout, acceptor.accept(stream)).await;
+            let tls_stream = match handshake {
+                Ok(Ok(s)) => {
                     metrics.record_tls_handshake_success();
                     s
                 }
-                Err(e) => {
+                Ok(Err(e)) => {
                     metrics.record_tls_handshake_failure();
                     tracing::debug!(peer = %peer, error = %e, "tls handshake failed");
+                    metrics.record_active_connection_closed();
+                    if let Some(obs) = observability {
+                        obs.record_client_connection_closed(peer_ip);
+                    }
+                    return;
+                }
+                Err(_) => {
+                    metrics.record_tls_handshake_failure();
+                    tracing::debug!(peer = %peer, "tls handshake timed out");
                     metrics.record_active_connection_closed();
                     if let Some(obs) = observability {
                         obs.record_client_connection_closed(peer_ip);

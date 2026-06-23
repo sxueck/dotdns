@@ -19,8 +19,13 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::{watch, Mutex};
+use tokio::sync::{watch, Mutex, Semaphore};
 use tokio_rustls::TlsAcceptor;
+
+/// Upper bound on concurrently handled connections per server. Combined with the
+/// TLS-handshake timeout this prevents slowloris-style resource exhaustion from
+/// many half-open connections.
+pub(crate) const MAX_CONCURRENT_CONNECTIONS: usize = 4096;
 
 #[derive(Debug, thiserror::Error)]
 pub enum ServerError {
@@ -85,49 +90,71 @@ impl PendingQueries {
             }
         };
 
-        if !leader {
+        if leader {
+            // Run the upstream query in a detached task so that map cleanup and
+            // result delivery always happen, even if *this* request future is
+            // cancelled (e.g. a DoH client disconnects mid-flight). If we awaited
+            // `pool.query` inline, a dropped future would skip the `remove` below,
+            // leaking the map entry forever and permanently poisoning dedup for
+            // that key (followers would then block until timeout indefinitely).
+            self.metrics.record_pending_leader_started();
+            let pool = pool.clone();
+            let query_owned = query.clone();
+            let inner = self.inner.clone();
+            let metrics = self.metrics.clone();
+            let task_key = key.clone();
+            tokio::spawn(async move {
+                let result = pool.query(&query_owned).await;
+                metrics.record_pending_leader_completed();
+                let tx = {
+                    let mut inner = inner.lock().await;
+                    inner.remove(&task_key).map(|entry| entry.tx)
+                };
+                if let Some(tx) = tx {
+                    let _ = tx.send(Some(result));
+                }
+            });
+        } else {
             self.metrics.record_pending_follower_joined();
-            let result = tokio::time::timeout(PENDING_FOLLOWER_TIMEOUT, async {
-                loop {
-                    if let Some(result) = rx.borrow().clone() {
-                        return Some(result);
-                    }
-                    if rx.changed().await.is_err() {
-                        return None;
-                    }
-                }
-            })
-            .await;
+        }
 
-            return match result {
-                Ok(Some(r)) => {
+        // Both the leader and any followers wait on the shared result. The
+        // timeout guards against a stuck upstream task so callers never block
+        // indefinitely.
+        let result = tokio::time::timeout(PENDING_FOLLOWER_TIMEOUT, async {
+            loop {
+                if let Some(result) = rx.borrow().clone() {
+                    return Some(result);
+                }
+                if rx.changed().await.is_err() {
+                    return None;
+                }
+            }
+        })
+        .await;
+
+        match result {
+            Ok(Some(r)) => {
+                if !leader {
                     self.metrics.record_pending_follower_resolved();
-                    r
                 }
-                Ok(None) => {
+                r
+            }
+            Ok(None) => {
+                if !leader {
                     self.metrics.record_pending_follower_timeout();
-                    Err(UpstreamError::Network(
-                        "pending upstream request was cancelled".into(),
-                    ))
                 }
-                Err(_) => {
+                Err(UpstreamError::Network(
+                    "pending upstream request was cancelled".into(),
+                ))
+            }
+            Err(_) => {
+                if !leader {
                     self.metrics.record_pending_follower_timeout();
-                    Err(UpstreamError::Timeout)
                 }
-            };
+                Err(UpstreamError::Timeout)
+            }
         }
-
-        self.metrics.record_pending_leader_started();
-        let result = pool.query(query).await;
-        self.metrics.record_pending_leader_completed();
-        let tx = {
-            let mut inner = self.inner.lock().await;
-            inner.remove(&key).map(|entry| entry.tx)
-        };
-        if let Some(tx) = tx {
-            let _ = tx.send(Some(result.clone()));
-        }
-        result
     }
 }
 
@@ -174,10 +201,12 @@ impl Server {
 
         let idle_timeout = self.config.server.idle_timeout;
         let mut tasks = tokio::task::JoinSet::new();
+        let conn_limit = Arc::new(Semaphore::new(MAX_CONCURRENT_CONNECTIONS));
 
         for listener in listeners {
             tasks.spawn(accept_loop(
                 listener,
+                conn_limit.clone(),
                 ConnectionContext {
                     acceptor: acceptor.clone(),
                     metrics: self.metrics.clone(),
@@ -287,9 +316,20 @@ struct ConnectionContext {
     observability: Option<Arc<ObservabilityRegistry>>,
 }
 
-async fn accept_loop(listener: TcpListener, ctx: ConnectionContext) -> Result<(), ServerError> {
+async fn accept_loop(
+    listener: TcpListener,
+    conn_limit: Arc<Semaphore>,
+    ctx: ConnectionContext,
+) -> Result<(), ServerError> {
     loop {
         let (stream, peer) = listener.accept().await?;
+        // Apply backpressure: block accepting further work once the concurrency
+        // limit is reached. The permit is held for the lifetime of the connection
+        // task and released on completion.
+        let permit = match conn_limit.clone().acquire_owned().await {
+            Ok(p) => p,
+            Err(_) => break Ok(()),
+        };
         let conn_ctx = ctx.clone();
         ctx.metrics.record_accepted_connection();
         if let Some(obs) = &ctx.observability {
@@ -300,6 +340,7 @@ async fn accept_loop(listener: TcpListener, ctx: ConnectionContext) -> Result<()
         let observability = conn_ctx.observability.clone();
         let peer_ip = peer.ip();
         tokio::spawn(async move {
+            let _permit = permit;
             if let Err(e) = handle_connection(stream, peer, conn_ctx).await {
                 tracing::debug!(peer = %peer, error = %e, "connection closed");
             }
@@ -349,14 +390,20 @@ async fn handle_connection(
     peer: SocketAddr,
     ctx: ConnectionContext,
 ) -> Result<(), ServerError> {
-    let mut tls_stream = match ctx.acceptor.accept(stream).await {
-        Ok(s) => {
+    let mut tls_stream = match tokio::time::timeout(ctx.idle_timeout, ctx.acceptor.accept(stream))
+        .await
+    {
+        Ok(Ok(s)) => {
             ctx.metrics.record_tls_handshake_success();
             s
         }
-        Err(e) => {
+        Ok(Err(e)) => {
             ctx.metrics.record_tls_handshake_failure();
             return Err(ServerError::Tls(e.to_string()));
+        }
+        Err(_) => {
+            ctx.metrics.record_tls_handshake_failure();
+            return Err(ServerError::Timeout);
         }
     };
 
